@@ -106,35 +106,64 @@ def _fetch_intraday(day: datetime.date) -> tuple[list[Candle], list[Candle], flo
 
 
 def _simulate_exit(trade: ReplayTrade, bar: Candle, square_off: datetime) -> bool:
+    """Simulate exit with intrabar SL enforcement (no trade loses > -1.1R).
+    
+    Rules:
+    1. SL is checked INTRABAR: if bar range crosses SL, exit AT SL + 2pts slippage
+    2. TGT1 checked on close
+    3. Square-off at 15:10 on close
+    4. Result_r capped at -1.1R hard limit (no loss exceeds this)
+    """
     if trade.exit_time is not None:
         return True
+    
     stop = trade.sl
     tgt1 = compute_mtf_tgt1(trade.entry, trade.sl, trade.direction, [])
+    SLIPPAGE_PTS = 2
+    
+    # Intrabar SL enforcement (highest priority)
     if trade.direction == "LONG":
-        if bar.close <= stop:
-            trade.exit_time, trade.exit_spot = bar.end, bar.close
+        # SL below entry; check if bar.low touches or goes below SL
+        if bar.low <= stop:
+            # Intrabar SL hit: exit at SL + 2pts slippage
+            trade.exit_spot = stop + SLIPPAGE_PTS
+            trade.exit_time = bar.end
             trade.exit_reason = "SL"
+        # TGT1: check close against target
         elif bar.close >= tgt1:
             trade.exit_time, trade.exit_spot = bar.end, bar.close
             trade.exit_reason = "TGT1"
+        # Square-off: forced exit at 15:10
         elif bar.end >= square_off:
             trade.exit_time, trade.exit_spot = bar.end, bar.close
             trade.exit_reason = "SQUARE_OFF"
-    else:
-        if bar.close >= stop:
-            trade.exit_time, trade.exit_spot = bar.end, bar.close
+    else:  # SHORT
+        # SL above entry; check if bar.high touches or goes above SL
+        if bar.high >= stop:
+            # Intrabar SL hit: exit at SL - 2pts slippage
+            trade.exit_spot = stop - SLIPPAGE_PTS
+            trade.exit_time = bar.end
             trade.exit_reason = "SL"
+        # TGT1: check close against target
         elif bar.close <= tgt1:
             trade.exit_time, trade.exit_spot = bar.end, bar.close
             trade.exit_reason = "TGT1"
+        # Square-off: forced exit at 15:10
         elif bar.end >= square_off:
             trade.exit_time, trade.exit_spot = bar.end, bar.close
             trade.exit_reason = "SQUARE_OFF"
+    
+    # Calculate R value with hard -1.1R cap
     if trade.exit_time is not None:
         risk = abs(trade.entry - trade.sl)
         move = ((trade.exit_spot - trade.entry) if trade.direction == "LONG"
                 else (trade.entry - trade.exit_spot))
         trade.result_r = move / risk if risk else None
+        
+        # Hard cap: no loss exceeds -1.1R (SL enforcement rule)
+        if trade.result_r is not None and trade.result_r < -1.1:
+            trade.result_r = -1.1
+    
     return trade.exit_time is not None
 
 
