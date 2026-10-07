@@ -1,0 +1,4 @@
+{
+  "description": "EVENT_CALENDAR: dates you want treated as NO-TRADE DAY (union budget, RBI/Fed policy days, election results, etc.). Per spec: silent - Telegram alerts suppressed, journaled only. Data logging continues so the replay backtester (Phase C) still sees the session. Format: YYYY-MM-DD.",
+  "dates": []
+}

@@ -1,0 +1,320 @@
+{
+  "records": {
+    "expiryDates": ["06-Oct-2026", "13-Oct-2026"],
+    "timestamp": "05-Oct-2026 09:15:00",
+    "underlying": "NIFTY",
+    "underlyingValue": 24950.15,
+    "data": [
+      {
+        "strikePrice": 24700,
+        "expiryDate": "06-Oct-2026",
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026PE24700.00",
+          "openInterest": 85000,
+          "changeinOpenInterest": 5000,
+          "pChangeinOpenInterest": 6.25,
+          "lastPrice": 22.4,
+          "change": 3.1,
+          "pChange": 16.05,
+          "impliedVolatility": 14.1,
+          "totalTradedVolume": 41000,
+          "bidprice": 22.2,
+          "askPrice": 22.6,
+          "bidQty": 1200,
+          "askQty": 900
+        }
+      },
+      {
+        "strikePrice": 24800,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026CE24800.00",
+          "openInterest": 120000,
+          "changeinOpenInterest": -15000,
+          "pChangeinOpenInterest": -11.11,
+          "lastPrice": 310.5,
+          "change": -12.4,
+          "pChange": -3.84,
+          "impliedVolatility": 13.8,
+          "totalTradedVolume": 88000,
+          "bidprice": 309.8,
+          "askPrice": 311.2,
+          "bidQty": 600,
+          "askQty": 450
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026PE24800.00",
+          "openInterest": 165000,
+          "changeinOpenInterest": 9000,
+          "pChangeinOpenInterest": 5.77,
+          "lastPrice": 55.2,
+          "change": 6.7,
+          "pChange": 13.81,
+          "impliedVolatility": 14.0,
+          "totalTradedVolume": 96000,
+          "bidprice": 55.0,
+          "askPrice": 55.5,
+          "bidQty": 1500,
+          "askQty": 1100
+        }
+      },
+      {
+        "strikePrice": 24900,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026CE24900.00",
+          "openInterest": 210000,
+          "changeinOpenInterest": 25000,
+          "pChangeinOpenInterest": 13.51,
+          "lastPrice": 205.3,
+          "change": -8.1,
+          "pChange": -3.8,
+          "impliedVolatility": 13.5,
+          "totalTradedVolume": 132000,
+          "bidprice": 204.9,
+          "askPrice": 205.8,
+          "bidQty": 800,
+          "askQty": 700
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026PE24900.00",
+          "openInterest": 545000,
+          "changeinOpenInterest": -32000,
+          "pChangeinOpenInterest": -5.55,
+          "lastPrice": 102.7,
+          "change": 14.2,
+          "pChange": 16.06,
+          "impliedVolatility": 14.3,
+          "totalTradedVolume": 154000,
+          "bidprice": 102.4,
+          "askPrice": 103.1,
+          "bidQty": 2000,
+          "askQty": 1600
+        }
+      },
+      {
+        "strikePrice": 25000,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026CE25000.00",
+          "openInterest": 465000,
+          "changeinOpenInterest": 65000,
+          "pChangeinOpenInterest": 16.25,
+          "lastPrice": 118.9,
+          "change": -9.3,
+          "pChange": -7.26,
+          "impliedVolatility": 13.2,
+          "totalTradedVolume": 205000,
+          "bidprice": 118.5,
+          "askPrice": 119.4,
+          "bidQty": 1800,
+          "askQty": 1400
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026PE25000.00",
+          "openInterest": 480000,
+          "changeinOpenInterest": -38000,
+          "pChangeinOpenInterest": -7.33,
+          "lastPrice": 96.4,
+          "change": 11.8,
+          "pChange": 13.94,
+          "impliedVolatility": 14.6,
+          "totalTradedVolume": 230000,
+          "bidprice": 96.1,
+          "askPrice": 96.9,
+          "bidQty": 2400,
+          "askQty": 1900
+        }
+      },
+      {
+        "strikePrice": 25100,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026CE25100.00",
+          "openInterest": 305000,
+          "changeinOpenInterest": 12000,
+          "pChangeinOpenInterest": 4.1,
+          "lastPrice": 52.8,
+          "change": -6.2,
+          "pChange": -10.51,
+          "impliedVolatility": 13.0,
+          "totalTradedVolume": 121000,
+          "bidprice": 52.5,
+          "askPrice": 53.2,
+          "bidQty": 900,
+          "askQty": 800
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026PE25100.00",
+          "openInterest": 285000,
+          "changeinOpenInterest": 18000,
+          "pChangeinOpenInterest": 6.74,
+          "lastPrice": 178.2,
+          "change": 22.6,
+          "pChange": 14.51,
+          "impliedVolatility": 15.0,
+          "totalTradedVolume": 118000,
+          "bidprice": 177.8,
+          "askPrice": 178.9,
+          "bidQty": 1000,
+          "askQty": 850
+        }
+      },
+      {
+        "strikePrice": 25200,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY06-10-2026CE25200.00",
+          "openInterest": 145000,
+          "changeinOpenInterest": 8000,
+          "pChangeinOpenInterest": 5.84,
+          "lastPrice": 21.6,
+          "change": -4.1,
+          "pChange": -15.95,
+          "impliedVolatility": 12.9,
+          "totalTradedVolume": 64000,
+          "bidprice": 21.4,
+          "askPrice": 21.9,
+          "bidQty": 700,
+          "askQty": 650
+        }
+      },
+      {
+        "strikePrice": 24900,
+        "expiryDate": "13-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY13-10-2026CE24900.00",
+          "openInterest": 95000,
+          "changeinOpenInterest": 12000,
+          "pChangeinOpenInterest": 14.46,
+          "lastPrice": 288.4,
+          "change": -11.2,
+          "pChange": -3.74,
+          "impliedVolatility": 13.9,
+          "totalTradedVolume": 41000,
+          "bidprice": 287.6,
+          "askPrice": 289.3,
+          "bidQty": 300,
+          "askQty": 250
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY13-10-2026PE24900.00",
+          "openInterest": 175000,
+          "changeinOpenInterest": -9000,
+          "pChangeinOpenInterest": -4.89,
+          "lastPrice": 141.2,
+          "change": 19.4,
+          "pChange": 15.92,
+          "impliedVolatility": 14.8,
+          "totalTradedVolume": 52000,
+          "bidprice": 140.8,
+          "askPrice": 141.9,
+          "bidQty": 500,
+          "askQty": 400
+        }
+      },
+      {
+        "strikePrice": 25000,
+        "expiryDate": "13-Oct-2026",
+        "CE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY13-10-2026CE25000.00",
+          "openInterest": 260000,
+          "changeinOpenInterest": -18000,
+          "pChangeinOpenInterest": -6.47,
+          "lastPrice": 201.7,
+          "change": -13.9,
+          "pChange": -6.44,
+          "impliedVolatility": 13.6,
+          "totalTradedVolume": 88000,
+          "bidprice": 201.1,
+          "askPrice": 202.5,
+          "bidQty": 350,
+          "askQty": 300
+        },
+        "PE": {
+          "underlying": "NIFTY",
+          "identifier": "OPTIDXNIFTY13-10-2026PE25000.00",
+          "openInterest": 310000,
+          "changeinOpenInterest": 26000,
+          "pChangeinOpenInterest": 9.16,
+          "lastPrice": 148.9,
+          "change": 26.3,
+          "pChange": 21.45,
+          "impliedVolatility": 15.1,
+          "totalTradedVolume": 96000,
+          "bidprice": 148.3,
+          "askPrice": 149.6,
+          "bidQty": 600,
+          "askQty": 450
+        }
+      }
+    ]
+  },
+  "filtered": {
+    "data": [
+      {
+        "strikePrice": 25000,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "openInterest": 465000,
+          "changeinOpenInterest": 65000,
+          "lastPrice": 118.9,
+          "impliedVolatility": 13.2,
+          "totalTradedVolume": 205000
+        },
+        "PE": {
+          "openInterest": 480000,
+          "changeinOpenInterest": -38000,
+          "lastPrice": 96.4,
+          "impliedVolatility": 14.6,
+          "totalTradedVolume": 230000
+        }
+      },
+      {
+        "strikePrice": 24900,
+        "expiryDate": "06-Oct-2026",
+        "CE": {
+          "openInterest": 210000,
+          "changeinOpenInterest": 25000,
+          "lastPrice": 205.3,
+          "impliedVolatility": 13.5,
+          "totalTradedVolume": 132000
+        },
+        "PE": {
+          "openInterest": 545000,
+          "changeinOpenInterest": -32000,
+          "lastPrice": 102.7,
+          "impliedVolatility": 14.3,
+          "totalTradedVolume": 154000
+        }
+      }
+    ],
+    "CE": {
+      "totOI": 1245000,
+      "totVol": 610000,
+      "totContracts": 6100,
+      "prevTotOI": 1180000,
+      "prevTotVol": 588000
+    },
+    "PE": {
+      "totOI": 1560000,
+      "totVol": 639000,
+      "totContracts": 6390,
+      "prevTotOI": 1613000,
+      "prevTotVol": 610000
+    }
+  }
+}

@@ -1,0 +1,13 @@
+requests>=2.31
+pandas>=2.0
+yfinance>=0.2.40
+python-dotenv>=1.0
+tzdata>=2024.1
+
+# dashboard (Prompt B module 5)
+streamlit>=1.36
+starlette>=0.40.0
+plotly>=5.22
+
+# tests
+pytest>=7.4
