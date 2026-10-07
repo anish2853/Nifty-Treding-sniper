@@ -178,6 +178,12 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
     open_trades: list[ReplayTrade] = []
     square_off = datetime.combine(day, settings.SQUARE_OFF_TIME, tzinfo=settings.IST)
     minute_index = {c.start: i for i, c in enumerate(one_minute)}
+    
+    # DEDUPLICATION & CAP TRACKING
+    fired_keys = set()  # (family, level_name, direction, candle_start) -> track each signal once
+    daily_trade_count = 0
+    last_entry_time = {}  # direction -> last entry datetime (for cooldown)
+    trades_per_direction = {"LONG": 0, "SHORT": 0}  # per-direction cap
 
     class MarketStub:
         def __init__(self):
@@ -237,6 +243,45 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
                     continue
                 family = ("LEVEL-FADE" if zone.zone_id.startswith("FADE-")
                           else "MTF-SCALP")
+                
+                # BUILD DEDUP KEY: family + level_name + direction + candle_start
+                level_name = zone.zone_id.split("_")[0] if "_" in zone.zone_id else zone.zone_id
+                dedup_key = (family, level_name, zone.direction, candle.start.isoformat())
+                
+                # CHECK DEDUP: Skip if this exact signal already fired this candle
+                if dedup_key in fired_keys:
+                    result.zone_log.append(
+                        f"{candle.end:%H:%M} skip {zone.zone_id}: duplicate (already fired)")
+                    continue
+                
+                # CHECK CAPS
+                # 1. Daily cap (max 2 trades/day)
+                if daily_trade_count >= settings.MAX_TRADES_PER_DAY:
+                    result.zone_log.append(
+                        f"{candle.end:%H:%M} skip {zone.zone_id}: daily cap reached ({daily_trade_count}/{settings.MAX_TRADES_PER_DAY})")
+                    continue
+                
+                # 2. Per-direction cap (max 1 per direction)
+                if trades_per_direction[zone.direction] >= settings.MAX_TRADES_PER_DIRECTION:
+                    result.zone_log.append(
+                        f"{candle.end:%H:%M} skip {zone.zone_id}: {zone.direction} cap reached ({trades_per_direction[zone.direction]}/{settings.MAX_TRADES_PER_DIRECTION})")
+                    continue
+                
+                # 3. Cooldown (20 min trend, 30 min range)
+                cooldown_mins = 20 if day_state.state in ("TREND-UP", "TREND-DOWN") else 30
+                if zone.direction in last_entry_time:
+                    time_since_last = (candle.end - last_entry_time[zone.direction]).total_seconds() / 60
+                    if time_since_last < cooldown_mins:
+                        result.zone_log.append(
+                            f"{candle.end:%H:%M} skip {zone.zone_id}: cooldown ({time_since_last:.0f}/{cooldown_mins} min)")
+                        continue
+                
+                # FIRE: All checks passed
+                fired_keys.add(dedup_key)
+                daily_trade_count += 1
+                trades_per_direction[zone.direction] += 1
+                last_entry_time[zone.direction] = candle.end
+                
                 open_trades.append(ReplayTrade(
                     day=result.date, family=family, direction=zone.direction,
                     entry_time=zone.confirm_time or candle.end,
@@ -253,6 +298,34 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
                 runway, _nearest = runtime.runway(candle.close, event.direction)
                 if runway is None or runway < settings.ROOM_TO_RUN_MIN_PTS:
                     continue
+                
+                # BUILD DEDUP KEY
+                level_name = getattr(event, 'level_name', 'LEVEL')
+                dedup_key = (family, level_name, event.direction, candle.start.isoformat())
+                
+                # CHECK DEDUP
+                if dedup_key in fired_keys:
+                    continue
+                
+                # CHECK CAPS
+                if daily_trade_count >= settings.MAX_TRADES_PER_DAY:
+                    continue
+                if trades_per_direction[event.direction] >= settings.MAX_TRADES_PER_DIRECTION:
+                    continue
+                
+                # CHECK COOLDOWN
+                cooldown_mins = 20 if day_state.state in ("TREND-UP", "TREND-DOWN") else 30
+                if event.direction in last_entry_time:
+                    time_since_last = (candle.end - last_entry_time[event.direction]).total_seconds() / 60
+                    if time_since_last < cooldown_mins:
+                        continue
+                
+                # FIRE
+                fired_keys.add(dedup_key)
+                daily_trade_count += 1
+                trades_per_direction[event.direction] += 1
+                last_entry_time[event.direction] = candle.end
+                
                 open_trades.append(ReplayTrade(
                     day=result.date, family=family, direction=event.direction,
                     entry_time=candle.end, entry=float(candle.close),
@@ -264,6 +337,32 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
         div_suppressed = any(event.kind == "DIVERGENCE-TRAP-SKIPPED" for event in events)
         for coil_event in coil_engine.on_five_minute(candle, runtime.grid, div_suppressed):
             if coil_event.kind == "ENTRY" and coil_event.entry is not None:
+                # BUILD DEDUP KEY
+                dedup_key = ("COIL-SNIPE", "COIL", coil_event.direction, candle.start.isoformat())
+                
+                # CHECK DEDUP
+                if dedup_key in fired_keys:
+                    continue
+                
+                # CHECK CAPS
+                if daily_trade_count >= settings.MAX_TRADES_PER_DAY:
+                    continue
+                if trades_per_direction[coil_event.direction] >= settings.MAX_TRADES_PER_DIRECTION:
+                    continue
+                
+                # CHECK COOLDOWN
+                cooldown_mins = 20 if day_state.state in ("TREND-UP", "TREND-DOWN") else 30
+                if coil_event.direction in last_entry_time:
+                    time_since_last = (candle.end - last_entry_time[coil_event.direction]).total_seconds() / 60
+                    if time_since_last < cooldown_mins:
+                        continue
+                
+                # FIRE
+                fired_keys.add(dedup_key)
+                daily_trade_count += 1
+                trades_per_direction[coil_event.direction] += 1
+                last_entry_time[coil_event.direction] = candle.end
+                
                 open_trades.append(ReplayTrade(
                     day=result.date, family="COIL-SNIPE",
                     direction=coil_event.direction,
