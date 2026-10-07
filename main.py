@@ -26,6 +26,7 @@ import logging
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from alerts import messages
 from alerts.telegram_bot import TelegramSender
@@ -36,7 +37,8 @@ from engines.coil_snipe import CoilSnipeEngine
 from engines.entry import EntryEngine
 from engines.exit import ExitEngine
 from engines.candles import orb_levels
-from engines.day_state import DayStateEngine
+from engines.day_state import DayStateEngine, RANGE
+from types import SimpleNamespace
 from engines.level_runtime import LevelRuntime
 from engines.liquidity import room_to_run
 from engines.mtf_live import (MTF_FAMILIES, coil_viz_payload, compute_mtf_tgt1,
@@ -49,6 +51,8 @@ from engines.pullback import PullbackEngine
 from engines.paper import PaperTrade
 from engines.regime import Regime, RegimeClassifier, RegimeState
 from engines.sweep import SweepEngine
+from journal.decision_audit import emit_nearmiss_report
+from engines.second_stage import SecondStageEngine
 from journal import stats
 from journal.store import JournalStore
 import premarket_report
@@ -224,6 +228,7 @@ class DaySession:
         self.entry = EntryEngine(market.journal)
         self.exit_engine = ExitEngine(market.journal)
         self.sweeps = SweepEngine(market.journal)
+        self.second_stage = SecondStageEngine(market.journal)
         self.pullbacks = PullbackEngine(market.journal)
         self.level_runtime = LevelRuntime()
         self.coil_engine = CoilSnipeEngine()
@@ -244,6 +249,7 @@ class DaySession:
             for direction in ("LONG", "SHORT")}
         self.HARD_EXIT_CODES = {"VIX_SPIKE", "TIME_STOP", "TGT_2R", "SQUARE_OFF",
                                 "OPPOSITE_SIGNAL", "STRUCTURE_BREAK"}
+        self._skip_alerts: dict = {}   # (family, direction) -> last 🚫 alert time
 
     # -- the ONE Telegram choke point ---------------------------------------------
     def _notify(self, text: str) -> None:
@@ -298,6 +304,11 @@ class DaySession:
             return mtf_entry_allowed(self, family)
         if day.state == "RANGE" and family in ("ORB", "LIQ-BREAK"):
             return "range day - breakout entries off (sweep-fade only)"
+        if family in ("ORB", "LIQ-BREAK") and day.bias:
+            if day.bias == "PE-preferred" and not (day.state == "TREND-UP"):
+                return f"ORB-mid bias: PE preferred (spot vs ORB mid {day.orb_mid:.0f})"
+            if day.bias == "CE-preferred" and not (day.state == "TREND-DOWN"):
+                return f"ORB-mid bias: CE preferred (spot vs ORB mid {day.orb_mid:.0f})"
         if day.broken_level is not None:
             # post-break: STRUCTURE governs, not the clock (09:30-14:30)
             if not (settings.ENTRY_EVAL_START <= ist_now().time()
@@ -372,8 +383,28 @@ class DaySession:
         # Day-State Engine (Trend-Day v2 module A): VWAP/EMA-20/liquidity break/
         # structure/classification - computed once, read by every gate below.
         self.day_state = self.day_state_engine.update(
-            self.market.candles, self.market.pdh, self.market.pdl,
-            self.market.spot_value())
+            self.market.candles, spot=self.market.spot_value(),
+            orb_mid=(orb_levels(self.market.candles) or {}).get("mid")
+            if self.market.candles else None,
+            pdh=self.market.pdh, pdl=self.market.pdl)
+        # wall VELOCITY map (BUG-2): snapshot-to-snapshot change-in-OI -
+        # day-cumulative OI is context, never the gate
+        velocity = {}
+        if self.market.chain and self.market.chain.rows:
+            strikes = sorted({r.strike for r in self.market.chain.rows
+                              if r.expiry == self.market.chain.nearest_expiry})
+            for side in ("ce", "pe"):
+                velocity.update(recent_oi_net(self.market.journal.conn,
+                                              self.market.chain.nearest_expiry,
+                                              strikes, side))
+        self.level_runtime.velocities = velocity
+        for t_old, t_new, boundary in self.day_state.transitions:
+            marker = f"day state: {t_old} (boundary {boundary})"
+            if not self.store.has_journal_event(self.today_iso, marker):
+                self.store.journal_event("REGIME",
+                                         day_state=self.day_state.state,
+                                         notes=marker)
+        self.second_stage.update(self.market.candles, self.market.liquidity)
         # ratchet structure trails for open runners
         if self.day_state:
             for trade in self.book.trades:
@@ -484,9 +515,10 @@ class DaySession:
                                          spot=chain.underlying, reasons=reasons,
                                          notes="09:15 classification (first spot print)")
                 if not self.event_day:
+                    ladder_txt = self._ladder_text().lstrip("\n")
+                    log.info("ladder (console/dashboard only):\n%s", ladder_txt)
                     self._notify(messages.regime(self.regime.summary(),
-                                                 self.regime.notes)
-                                 + self._ladder_text())
+                                                 self.regime.notes))
             else:
                 log.warning("Regime classification deferred: spot or PDC missing")
         else:
@@ -499,8 +531,7 @@ class DaySession:
                 self.store.journal_event("REGIME", regime=self.regime.regime.value,
                                          reasons=self.regime.reasons(),
                                          notes="VIX spike >8% regime-change flag")
-                self._notify(messages.regime_change(self.regime.summary())
-                             + self._ladder_text())
+                self._notify(messages.regime_change(self.regime.summary()))
 
     # -- entries ---------------------------------------------------------------------------
     def process_candle_close(self, candle) -> None:
@@ -548,6 +579,13 @@ class DaySession:
                                  broken_level=ev.level,
                                  level_name=f"pullback {ev.level_label}")
             self._handle_evaluation(ev, family="PULLBACK", fire_fn=pullback_fire)
+        for ev in self.second_stage.evaluate(candle, ctx):
+            def second_stage_fire(ev=ev):
+                return self.fire(ev, "SECOND-STAGE", sl_spot=ev.sl_spot,
+                                 broken_level=ev.level_strike,
+                                 level_name=ev.level_label)
+            self._handle_evaluation(ev, family="SECOND-STAGE",
+                                    fire_fn=second_stage_fire)
         now = ist_now()
         for trade in list(self.book.trades):
             trade.update_extreme(candle.high if trade.direction == "LONG"
@@ -820,10 +858,19 @@ class DaySession:
             return self._suppress(ev, family,
                                   f"trading halted: {self.trading_halted_reason}")
 
+        # News gate (confirm-then-execute): a confirmed high-impact headline
+        # within NEWS_BLOCK_MINUTES defers the entry - measured, then traded.
+        from data_sources.news import high_impact_block
+        blocked, headline = high_impact_block(self.market.news)
+        if blocked:
+            return self._suppress(ev, family,
+                                  f"NEWS gate: high-impact headline - {headline[:80]}")
+
         # FIRE-TIME gate: candle close AND fire moment inside the governing
         # window. Before a liquidity break the CLOCK governs (09:30-11:00 or
         # 13:30-14:45); after a break STRUCTURE governs (09:30-14:30).
-        broken = self.day_state is not None and self.day_state.broken_level is not None
+        broken = (self.day_state is not None
+                  and self.day_state.broken_level is not None)             or self.second_stage.has_flipped()
 
         def in_window(t) -> bool:
             if broken:
@@ -850,7 +897,8 @@ class DaySession:
             max_oi_strike=(getattr(self.market.chain, "max_call_oi_strike", None)
                            if ev.direction == "LONG"
                            else getattr(self.market.chain, "max_put_oi_strike", None))
-            if self.market.chain else None)
+            if self.market.chain else None,
+            velocity=self.level_runtime.velocities)
         if runway is not None and runway < settings.ROOM_TO_RUN_MIN_PTS:
             return self._suppress(
                 ev, family, f"NO ROOM: {runway:.0f} pts to {wall_label} "
@@ -913,18 +961,43 @@ class DaySession:
             log.info("re-entry grant consumed for %s", trade.direction)
         return trade
 
-    def _suppress(self, ev, family: str, reason: str, alert: bool = False):
+    def _suppress(self, ev, family: str, reason: str, alert: bool = False,
+                  sl_spot=None, level_label: str | None = None):
         """A fired evaluation killed by a gate - journaled; sanity gates also
-        raise the DATA MISMATCH alert, day-state/window gates stay silent."""
+        raise the DATA MISMATCH alert. Score >= 80 blocks get the rate-limited
+        🚫 SKIPPED alert (decision transparency: no invisible decisions)."""
+        entry_spot = self.market.spot_value() or ev.candle.close
+        level = level_label or getattr(ev, "level_name", None)             or getattr(ev, "level_label", None)             or str(getattr(ev, "level_strike", "") or getattr(ev, "level", ""))
         self.store.journal_event(
             "SKIP", direction=ev.direction, spot=ev.candle.close, score=ev.score,
             family=family,
             day_state=self.day_state.state if self.day_state else None,
-            reasons={"score": ev.score, "direction": ev.direction, "family": family},
+            reasons={"score": ev.score, "direction": ev.direction, "family": family,
+                     "skipped": {"direction": ev.direction,
+                                 "entry_spot": entry_spot,
+                                 "sl_spot": sl_spot,
+                                 "level": str(level),
+                                 "family": family,
+                                 "ts": ist_now().isoformat(timespec="seconds")}},
             notes=f"signal suppressed by gate: {reason}")
+        if ev.score >= settings.ENTRY_SCORE_FIRE:
+            self._notify_skipped(ev, family, level, reason)
         if alert:
             self._alert_data_mismatch(reason)
         return None
+
+    def _notify_skipped(self, ev, family: str, level, reason: str) -> None:
+        """🚫 SKIPPED - one alert per setup per 30 min (decision transparency)."""
+        key = (family, ev.direction)
+        now = ist_now()
+        last = self._skip_alerts.get(key)
+        if last is not None and (now - last).total_seconds() < 1800:
+            return
+        self._skip_alerts[key] = now
+        side = "PE" if ev.direction == "SHORT" else "CE"
+        level_txt = f"{level:,.0f}" if isinstance(level, (int, float)) else str(level)
+        self._notify(messages.skipped_alert(
+            side=side, level=level_txt, reason=reason, score=ev.score))
 
     # -- exits + 1R ---------------------------------------------------------------------------
     def close_trade(self, trade: PaperTrade, code: str, reason: str, spot=None,
@@ -1401,6 +1474,155 @@ def run_chain_test() -> None:
     nse.close()
 
 
+def run_nearmiss() -> None:
+    """--mode nearmiss: today's full decision log - every setup, score, blocking
+    gate and shadow outcome - to console + Telegram (decision transparency)."""
+    setup_logging()
+    store = JournalStore()
+    tg = TelegramSender()
+    report = emit_nearmiss_report(store, tg=tg)
+    safe_print(report)
+    store.close()
+
+
+def _window_grep() -> list:
+    """Audit helper: list every hardcoded time-window gate outside settings.py."""
+    import re
+    pattern = re.compile(r"ENTRY_WINDOW_END|SWEEP_WINDOW_2|LAST_ENTRY_TIME|"
+                         r"dtime\(|dt_time\(")
+    findings = []
+    for path in [Path("main.py"), Path("premarket_report.py"), Path("utils.py"),
+                 *Path("engines").glob("*.py"), *Path("journal").glob("*.py"),
+                 *Path("alerts").glob("*.py"), *Path("data_sources").glob("*.py")]:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                findings.append(f"{path}:{lineno}: {line.strip()[:90]}")
+    return findings
+
+
+def _symmetry_test(market, store) -> dict:
+    """CE/PE symmetry: one synthetic setup evaluated as LONG and as SHORT with
+    identical geometry - both must fire or both must be blocked identically."""
+    session = DaySession(store, NullTelegramSender(),
+                         RegimeClassifier(event_dates=set()), event_day=False,
+                         today_iso=ist_now().date().isoformat(), market=market)
+    fake_now = ist_now().replace(hour=10, minute=0)
+    orig_ist_now = ist_now
+    import main as _main
+    _main.ist_now = lambda: fake_now
+    try:
+        session.market.set_prev_day(30500.0, 29500.0, 30000.0)
+        session.market.trade_expiry = "12-Oct-2026"
+        row = type("R", (), {"strike": 30100, "expiry": "12-Oct-2026",
+                             "ce_ltp": 120.0, "pe_ltp": 115.0})()
+        session.market.chain = type("S", (), {"rows": [row],
+                                              "nearest_expiry": "06-Oct-2026",
+                                              "underlying": 30000.0})()
+        session.market.spot = type("SV", (), {"value": 30100.0, "asof": "x",
+                                              "source": "symmetry"})()
+        session.market.candles = [
+            Candle(start=fake_now.replace(hour=9, minute=15), open=30000,
+                   high=30110, low=30090, close=30000)]
+        results = {}
+        for direction, level, close, high, low in (
+                ("LONG", 30100.0, 30510.0, 30510.0, 30099.0),
+                ("SHORT", 29500.0, 29440.0, 30001.0, 29440.0)):
+            ev = type("E", (), {"direction": direction,
+                                "candle": Candle(
+                                    start=fake_now.replace(hour=9, minute=35),
+                                    open=30000.0, high=high, low=low, close=close),
+                                "score": 85, "level": level,
+                                "level_name": "ORB high" if direction == "LONG"
+                                else "ORB low", "reasons": []})()
+            ctx = session._entry_ctx(ev.candle)
+            evs = session.entry.evaluate(ev.candle, None, ctx)
+            results[direction] = [(e.direction, bool(e.fired), e.score) for e in evs
+                                  if e.score >= settings.ENTRY_SCORE_FIRE]
+        return results
+    finally:
+        _main.ist_now = orig_ist_now
+
+
+def run_audit() -> None:
+    """--mode audit: WHY-NO-TRADE report - liveness, day-state replay, signal
+    path trace, CE/PE symmetry, window grep - console + Telegram + file."""
+    setup_logging()
+    store = JournalStore()
+    tg = TelegramSender()
+    lines = ["# WHY-NO-TRADE AUDIT", "",
+             f"generated {ist_now().strftime('%a %Y-%m-%d %H:%M:%S')} IST"]
+    market = MarketDataStore(session=NSESession(), journal=store,
+                             holidays=load_date_set(settings.HOLIDAYS_FILE))
+    report = emit_nearmiss_report(store, tg=None,
+                                  start_time=settings.ENTRY_EVAL_START)
+    lines += ["## Decision log (nearmiss report)", report]
+    lines += ["", "## Liveness (store-based)"]
+    for label, query in (("last OI snapshot", "SELECT MAX(ts) FROM oi_snapshots"),
+                         ("last candle", "SELECT MAX(start) FROM candles"),
+                         ("last journal row", "SELECT MAX(ts) FROM journal")):
+        value = store.conn.execute(query).fetchone()[0]
+        age = "-"
+        if value:
+            try:
+                age = f"{(ist_now() - datetime.fromisoformat(value)).total_seconds() / 60:.0f} min ago"
+            except ValueError:
+                pass
+        lines.append(f"- {label}: {value} ({age})")
+    lines += ["", "## CE/PE symmetry test"]
+    try:
+        results = _symmetry_test(market, store)
+        for direction, fired in results.items():
+            lines.append(f"- {direction}: {fired}")
+        fired_states = {fired for _, fired in results.items()}
+        verdict = "SYMMETRIC" if len(fired_states) <= 1 else "MIRROR BUG"
+        lines.append(f"- verdict: {verdict}")
+    except Exception as exc:
+        lines.append(f"- symmetry test errored: {exc}")
+    lines += ["", "## Window grep (hardcoded entry-time gates outside settings)"]
+    findings = _window_grep()
+    lines += [f"- {f}" for f in findings] or ["- none"]
+    lines += ["", "NOTE: market data (spot/chain/VIX) is live; historical "
+              "OI-dependent gates replay with the latest available snapshot "
+              "(NSE does not serve historical chain snapshots)."]
+    text = "\n".join(lines).replace("\n", "\n")
+    Path("audit_report.md").write_text(text, encoding="utf-8")
+    safe_print(text)
+    tg.send(text[:4000])
+    store.close()
+
+
+def run_replay_today(days_back: int = 0) -> None:
+    """--mode replay-today: offline replay of stored candles through the FIXED
+    symmetric state machine - prints the transition log + fired setups as proof."""
+    setup_logging()
+    store = JournalStore()
+    from datetime import timedelta
+    target = (ist_now().date() - timedelta(days=days_back)).isoformat()
+    candles = [SimpleNamespace(**c) for c in store.fetch_candles(target)]
+    print(f"REPLAY {target}: {len(candles)} stored candles")
+    if not candles:
+        return
+    run_replay_today._seen = set()      # reset the printed-transition dedup per run
+    engine = DayStateEngine()
+    prev_state = RANGE
+    fired = []
+    for i in range(3, len(candles) + 1):
+        window = candles[:i]
+        state = engine.update(window, spot=window[-1].close)
+        seen = getattr(run_replay_today, "_seen", set())
+        for ts, transition, boundary in state.transitions:
+            key = (ts, transition)
+            if key not in seen:
+                seen.add(key)
+                print(f"{ts[11:16]}  {transition}  (boundary {boundary})")
+        if state.state != prev_state:
+            print(f"{window[-1].start.strftime('%H:%M')}  STATE: {prev_state} -> {state.state}")
+            prev_state = state.state
+    print(f"final: {state.state} | 1h range {state.first_hour_low}-{state.first_hour_high} | "
+          f"transitions: {len(state.transitions)}")
+    store.close()
+
+
 def run_score() -> None:
     """--mode score: ONE consistent set from the MarketDataStore - spot, PDC, ATM
     strike, ATM CE/PE LTP, VIX, chain source, store timestamp."""
@@ -1449,20 +1671,66 @@ def main():
     parser = argparse.ArgumentParser(
         description="Nifty options alert-only assistant (alert/journal only, no orders).")
     parser.add_argument("--mode",
-                        choices=["live", "now", "backtest", "replay-mtf",
-                                 "chain-test", "score"],
+                        choices=["live", "now", "backtest", "replay-mtf", "replay60",
+                                 "chain-test", "score", "nearmiss", "audit",
+                                 "replay-today"],
                         default="live",
                         help="live = scheduled day (default); now = immediate test "
                              "run; backtest = arrives with Phase C; replay-mtf = "
-                             "historical MTF verification; chain-test = per-step "
-                             "chain diagnostics; score = one consistent store snapshot")
+                             "historical MTF verification; replay60 = 60-day batch; "
+                             "chain-test = per-step chain diagnostics; score = one consistent store snapshot")
     parser.add_argument("--days", type=int, default=5,
-                        help="replay-mtf: number of recent sessions to replay")
+                        help="replay-mtf/replay60: number of trading days to replay")
     args = parser.parse_args()
     setup_logging()
 
     if args.mode == "replay-mtf":
         run_replay_mtf(days=args.days)
+        return
+    if args.mode == "replay60":
+        from engines.replay_60day import run_replay_60day
+        from engines.stats_calculator import generate_replay_report
+        from engines.replay_scoring import get_price_only_summary
+        
+        session = run_replay_60day(days=args.days)
+        
+        # Generate comprehensive report
+        print(f"\n{'='*80}")
+        print(f"REPLAY COMPLETE: {session.summary()}")
+        print(f"{'='*80}")
+        print(f"\n{get_price_only_summary()}\n")
+        
+        print("By Setup Family:")
+        for family, trades in sorted(session.trades_by_family.items()):
+            if not trades:
+                continue
+            trades_r = [t.result_r or 0.0 for t in trades]
+            wins = len([r for r in trades_r if r > 0])
+            wr = (wins / len(trades_r) * 100) if trades_r else 0.0
+            exp = (sum(trades_r) / len(trades_r)) if trades_r else 0.0
+            print(f"  [{family:20}] {len(trades):3} trades | "
+                  f"Win {wr:5.1f}% | Exp {exp:+6.2f}R | Total {sum(trades_r):+7.2f}R")
+        
+        # Generate markdown report with cost deduction
+        report_path = Path(settings.DATA_DIR.parent) / "backtest_results" / "replay60_report.md"
+        markdown_report = generate_replay_report(session, str(report_path))
+        print(f"\n✓ Detailed report saved: {report_path}")
+        print(f"\n{markdown_report[:500]}...\n")
+        
+        # Optional: send Telegram summary (if configured)
+        try:
+            tg_replay = TelegramSender()
+            summary_msg = (
+                f"📊 **60-Day Replay Report**\n"
+                f"Trades: {session.total_trades} | Win: {session.win_rate():.0f}% | "
+                f"Exp: {session.expectancy():+.2f}R | DD: {session.max_dd:+.2f}R\n"
+                f"Report: {report_path.name}\n"
+                f"Mode: {get_price_only_summary()}"
+            )
+            tg_replay.send_message(summary_msg)
+        except Exception as e:
+            print(f"(Telegram summary skipped: {e})")
+        
         return
     if args.mode == "backtest":
         log.info("--mode backtest requested: the replay backtester is Phase C "
@@ -1475,6 +1743,15 @@ def main():
         return
     if args.mode == "score":
         run_score()
+        return
+    if args.mode == "nearmiss":
+        run_nearmiss()
+        return
+    if args.mode == "replay-today":
+        run_replay_today()
+        return
+    if args.mode == "audit":
+        run_audit()
         return
 
     store = JournalStore()

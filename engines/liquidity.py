@@ -48,13 +48,14 @@ class LiquidityMap:
     pcr_total: float | None = None
 
     def ladder_lines(self) -> list:
-        lines = ["LIQUIDITY MAP"]
+        lines = ["LIQUIDITY MAP (total OI | Δ change-in-OI)"]
         for name, level, pct in self.pools:
             lines.append(f"POOL {name} {level:,.0f} ({pct:+.2f}% from spot)")
         for lv in self.levels:
             strong = " STRONG" if lv.strong else ""
-            lines.append(f"{lv.label} {lv.strike:,.0f} OI {lv.oi:,.0f} {lv.arrow} "
-                         f"{lv.change_oi:+,.0f} | {lv.distance_pts:+,.0f} pts "
+            lines.append(f"{lv.label} {lv.strike:,.0f} total {lv.oi:,.0f} "
+                         f"{lv.arrow} Δ{lv.change_oi:+,.0f} | "
+                         f"{lv.distance_pts:+,.0f} pts "
                          f"({lv.distance_pct:+.2f}%){strong}")
         return lines
 
@@ -63,21 +64,22 @@ class LiquidityMap:
 
 
 def room_to_run(levels, spot, direction, pdh=None, pdl=None,
-                broken_level=None, max_oi_strike=None):
-    """Room-to-run gate (Trend-Day v2.1): distance to the nearest SIGNIFICANT
-    OI wall beyond the entry (R-levels for LONG / S-levels for SHORT with
-    OI > WALL_OI_MIN, plus the max-OI strike), and the measured move
-    (yesterday's PDH-PDL range projected from the break). The nearest wall or
-    measured-move target defines the available runway.
-    Returns (runway_pts | None, wall_label | None)."""
+                broken_level=None, max_oi_strike=None, velocity=None):
+    """Room-to-run gate (Trend-Day v2.1, OI semantics fix): a wall is significant
+    only when writers are ACTIVELY ADDING (change-in-OI > 0) - a big static OI is
+    yesterday's positions sitting there, not a wall. Candidates: R-levels for
+    LONG / S-levels for SHORT with rising change-in-OI, plus the max-OI strike
+    and the measured move (yesterday's PDH-PDL range from the break); the NEAREST
+    candidate binds (conservative). Returns (runway_pts | None, wall_label)."""
     if spot is None:
         return None, None
     walls = []
     if direction == "LONG":
         for lv in levels or []:
-            if lv.side == "R" and lv.strike > spot and lv.oi > settings.WALL_OI_MIN:
+            if lv.side == "R" and lv.strike > spot and                     (velocity or {}).get(lv.strike, 0) >= settings.WALL_VELOCITY_MIN:
                 walls.append((lv.strike - spot,
-                              f"{lv.strike:,.0f} (OI {lv.oi / 1000:.0f}k)"))
+                              f"{lv.strike:,.0f} (total {lv.oi / 1000:.0f}k, "
+                              f"Δ{velocity.get(lv.strike, 0) / 1000:+.0f}k/10m)"))
         if max_oi_strike is not None and max_oi_strike > spot:
             walls.append((max_oi_strike - spot, f"{max_oi_strike:,.0f} (max OI)"))
         if pdh is not None and pdl is not None and pdh > spot:
@@ -88,9 +90,10 @@ def room_to_run(levels, spot, direction, pdh=None, pdl=None,
                           f"measured move {base + rng:,.0f} (PDH-PDL range)"))
     else:
         for lv in levels or []:
-            if lv.side == "S" and lv.strike < spot and lv.oi > settings.WALL_OI_MIN:
+            if lv.side == "S" and lv.strike < spot and                     (velocity or {}).get(lv.strike, 0) >= settings.WALL_VELOCITY_MIN:
                 walls.append((spot - lv.strike,
-                              f"{lv.strike:,.0f} (OI {lv.oi / 1000:.0f}k)"))
+                              f"{lv.strike:,.0f} (total {lv.oi / 1000:.0f}k, "
+                              f"Δ{velocity.get(lv.strike, 0) / 1000:+.0f}k/10m)"))
         if max_oi_strike is not None and max_oi_strike < spot:
             walls.append((spot - max_oi_strike, f"{max_oi_strike:,.0f} (max OI)"))
         if pdh is not None and pdl is not None and pdl < spot:

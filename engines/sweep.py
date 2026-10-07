@@ -157,8 +157,35 @@ class SweepEngine:
                                ev.volume_detail))
 
             regime_ok, regime_note = ctx["regime_allows_sweep"](direction)
+            
+            # SWEEP-FADE state override: allow at strong confluence in ANY day state
+            state_override_triggered = False
+            if not regime_ok and "regime blocked" not in regime_note.lower():
+                from engines.sweep_fade_override import check_sweep_fade_override
+                day_state = ctx.get("day_state")
+                state_name = day_state.get("state") if day_state else None
+                
+                override = check_sweep_fade_override(
+                    direction=direction,
+                    level=level_strike,
+                    candle_close=candle.close,
+                    pdh=ctx.get("pdh"),
+                    pdl=ctx.get("pdl"),
+                    oi_wall_strikes=[lv.strike for lv in (ctx.get("liquidity").levels
+                                                          if ctx.get("liquidity") else [])
+                                    if lv.strong],
+                    divergence_present=False,  # Add divergence check if available
+                    day_state=state_name
+                )
+                
+                if override.triggered:
+                    regime_ok = True
+                    regime_note = f"STATE-OVERRIDE: {override.reason}"
+                    state_override_triggered = True
+            
             ev.regime_ok, ev.regime_note = regime_ok, regime_note
-            ev.reasons.append(("regime allows counter-direction", regime_ok,
+            ev.reasons.append(("regime allows counter-direction" + (" [STATE-OVERRIDE]" if state_override_triggered else ""),
+                               regime_ok,
                                settings.W_REGIME_VIX if regime_ok else 0, regime_note))
 
             ev.reasons.append(("time window 09:30-11:00 / 13:30-14:45", True,

@@ -170,6 +170,45 @@ store** (`data_sources/market_data.py`):
   `PULLBACK`) and day state (`TREND-UP` / `TREND-DOWN` / `RANGE`); EOD splits
   stats **BY SETUP** and **BY DAY STATE** alongside the exit-shadow buckets.
 
+## Dynamic budget, room-to-run, circuit breakers, news gate (v2.1)
+
+- **Room-to-run gate**: every signal needs >= 25 pts of runway to the nearest
+  significant wall - significance is OI **velocity** (writers actively adding,
+  change-in-OI > 0), never yesterday's static total; the measured move
+  (PDH-PDL range projected from the break) can rescue a setup. Blocked signals
+  journal "NO ROOM" and never consume the budget. Cards print
+  `RUNWAY: 43 pts to wall 22,700 (total 465k, Δ+45k)`.
+- **Dynamic budget**: TREND days 4 entries, RANGE days 2; wall-unwind
+  re-entries never count; cooldown 20 min (trend) / 30 min (range).
+- **Circuit breakers**: 2 consecutive full losses (-1R) -> shutdown;
+  day +2R -> profit lock (bank it); daily loss cap 5% -> shutdown.
+- **News gate** (`data_sources/news.py`, best effort): RSS headlines from
+  `settings.NEWS_SOURCES` are checked before every entry; a high-impact
+  keyword headline inside `NEWS_BLOCK_MINUTES` (30) defers the entry
+  (journaled, logged). Feed failure never blocks trading.
+- **Telegram carries trades only**: the liquidity ladder lives on the
+  dashboard and in logs - support/resistance dumps are never sent to the
+  phone. Trade cards, exits, and lifecycle alerts are the only traffic.
+
+## Dashboard as a diagnostic instrument
+
+- **State banner** (always visible): `DAY STATE: TREND-UP | since 12:05 | last
+  transition 2h 48m ago` — a stuck state becomes obvious instantly — plus store
+  freshness, last chain-poll age, last candle age, and budget remaining
+  (dynamic: TREND 4 / RANGE 2).
+- **Blocked-signal counters**: setups evaluated, fired, near-misses (55-79),
+  blocked (>= 80, gate rejected) with a per-gate breakdown (state / wall /
+  no-room / cooldown / …) — you SEE which gate is eating signals.
+- **Marker legend**: grey dot = near-miss (evaluation only, trades nothing) ·
+  orange dot = blocked setup (hover shows the gate) · ▲/▼/✕ = actual trades.
+  Only candles scoring >= 55 are marked.
+- **SAFETY ASSERTION**: the dashboard opens the journal with a SQLite
+  `mode=ro` URI — a dashboard bug *structurally cannot* write engine state,
+  the journal, or block signal generation (verified by test: writes raise
+  "attempt to write a readonly database"). The bot writes with **WAL**
+  (`PRAGMA journal_mode=WAL`), so writer (bot) and reader (Streamlit) never
+  lock each other.
+
 ## Setup
 
 1. Python 3.11+ (developed on 3.12).
@@ -379,3 +418,67 @@ tests/                   fixtures + parser/regime/stats/watchdog/sniper unit tes
 start_bot.bat            Task Scheduler launcher
 ```
 "# Nifty-Treding-sniper" 
+
+
+## Phase C - Historical Replay & Backtesting
+
+### Replay Engine (`--mode replay60`)
+
+Batch-process historical trading days to validate strategy performance:
+
+```bash
+python main.py --mode replay60 --days 60    # Full 60-day replay
+python main.py --mode replay60 --days 7     # Quick 7-day test
+```
+
+**Output**:
+- Console: trades-by-family summary
+- Markdown report: `backtest_results/replay60_report.md` with:
+  - Win rate, expectancy (R and rupees), max drawdown, longest streak
+  - Splits by family (LEVEL-FADE, MTF-SCALP, COIL-SNIPE, STATE-OVERRIDE)
+  - Splits by day state (TREND-UP, TREND-DOWN, RANGE)
+  - Splits by direction (LONG vs SHORT symmetry)
+  - Monthly performance
+  - 5-gate evaluation (expectancy, max DD, streak, trend/range positive)
+  - **Cost deduction**: ₹150 per trade automatically applied
+
+- Separate journal: `data/replay_journal.sqlite3` (isolated from live trades)
+- Telegram summary (if configured)
+
+**Scoring**: Price-only variant with 52/65 threshold (OI and volume components excluded — not available in historical data). All reports labeled: `MODE: PRICE-ONLY VARIANT | threshold: 52/65`.
+
+### CLI Replay Comparator (`replay_compare.py`)
+
+View and compare engine signals vs your manual marks:
+
+```bash
+# View Oct 6 engine signals
+python replay_compare.py --date 2026-10-06
+
+# Export to CSV
+python replay_compare.py --date 2026-10-06 --export oct6.csv
+
+# Interactive marking: record your trades and compare
+python replay_compare.py --date 2026-10-06 --interactive
+```
+
+**Output**: Formatted tables with all trades, state timeline (zone lifecycle), and comparison against your manual marks.
+
+### Streamlit Interactive Viewer (`dashboard/replay_viewer.py`)
+
+Visual replay with playback controls:
+
+```bash
+pip install streamlit plotly pandas  # One-time
+streamlit run dashboard/replay_viewer.py
+```
+
+**Features**:
+- Play / Pause / Step / Reset controls
+- Speed adjustment: 1x-10x
+- Live candlestick chart with signal markers (green/red triangles)
+- Click-to-mark entries during replay
+- Day-end comparison: your marks vs engine signals
+- Summary card: trades, win rate, total R, family breakdown
+
+All replay tools read from the same engine, so results are consistent across CLI, CSV, and visual modes.

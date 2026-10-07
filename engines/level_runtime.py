@@ -8,6 +8,7 @@ from engines.mtf_scalp import WAITING, confirm_zone
 class LevelRuntime:
     def __init__(self):
         self.grid = []
+        self.velocities = {}
         self.decision = LevelDecisionEngine()
         self.zones = {}
 
@@ -56,12 +57,25 @@ class LevelRuntime:
         return min(resistances) - max(supports)
 
     def runway(self, spot, direction):
+        """OI-smart runway (hotfix): only SIGNIFICANT walls count - writers
+        actively adding (change-in-OI > 0) or STRONG-tagged levels. Minor
+        swing levels with static OI are not walls and no longer block a
+        big move (the 100-pt SHORT at 12:51 was blocked by a 10-pt swing).
+        """
         if spot is None:
             return None, None
+        def significant(level):
+            velocity = self.velocities.get(level.price)
+            if velocity is not None:
+                return velocity >= settings.WALL_VELOCITY_MIN
+            return (level.change_oi is None or level.change_oi > 0
+                    or level.strong)
         if direction == "LONG":
-            ahead = [level for level in self.grid if level.price > spot]
+            ahead = [level for level in self.grid if level.price > spot
+                     and significant(level)]
         else:
-            ahead = [level for level in self.grid if level.price < spot]
+            ahead = [level for level in self.grid if level.price < spot
+                     and significant(level)]
         if not ahead:
             return None, None
         nearest = min(ahead, key=lambda level: abs(level.price - spot)) \

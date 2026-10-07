@@ -258,13 +258,18 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
         "day_state": None, "vwap": None, "vwap_proxy": False, "now": ist_now(),
     }
     history = []
+    
+    # Import scoring check for replay mode (price-only threshold: 52/65)
+    from engines.replay_scoring import should_fire_price_only
+    
     for candle in five_minute:
         history.append(candle)
         orb_ctx["orb"] = orb_levels(history)
         orb_ctx["spot"] = candle.close
         prev = history[-2] if len(history) > 1 else None
         for ev in entry_engine.evaluate(candle, prev, orb_ctx):
-            if ev.fired:
+            # Apply price-only scoring threshold (80% of available 65 pts = 52)
+            if ev.fired and should_fire_price_only(ev.score):
                 sl = orb_ctx["orb"]["mid"] if orb_ctx["orb"] else candle.close
                 result.orb_signals.append({
                     "time": candle.end.isoformat(timespec="seconds"),
@@ -272,6 +277,7 @@ def _replay_day(day: datetime.date) -> DayReplay | None:
                     "level": ev.level_name,
                     "close": candle.close,
                     "sl": sl,
+                    "score": ev.score,
                 })
     return result
 

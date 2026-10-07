@@ -10,7 +10,7 @@ import settings
 from alerts.telegram_bot import NullTelegramSender
 from data_sources.market_data import MarketDataStore
 from engines.candles import Candle
-from engines.day_state import RANGE, TREND_UP, DayStateEngine
+from engines.day_state import RANGE, TREND_DOWN, TREND_UP, DayStateEngine
 from engines.paper import PaperTrade
 from engines.regime import RegimeClassifier
 from journal.store import JournalStore
@@ -57,9 +57,15 @@ def test_liquidity_break_and_trend_up():
     engine = DayStateEngine()
     candles = [candle(9, 15, 22590, 22600, 22580, 22595),
                candle(9, 20, 22600, 22610, 22590, 22605),
-               candle(9, 25, 22605, 22720, 22600, 22710)]   # close > PDH 22700
-    state = engine.update(candles, pdh=22700.0, pdl=22500.0, spot=22705.0)
-    assert state.broken_level == 22700.0 and state.broken_side == "UP"
+               candle(9, 25, 22605, 22610, 22595, 22600),
+               candle(9, 30, 22600, 22605, 22590, 22595),
+               candle(9, 35, 22595, 22600, 22585, 22590),
+               candle(9, 40, 22590, 22595, 22580, 22585),
+               candle(10, 20, 22610, 22640, 22600, 22630),   # close > 1h high
+               candle(10, 25, 22630, 22650, 22625, 22645)]   # 2nd close -> TREND-UP
+    state = engine.update(candles, spot=22645.0)
+    assert state.first_hour_high == 22610.0 and state.first_hour_low == 22580.0
+    assert state.broken_level == 22610.0 and state.broken_side == "UP"
     assert state.state == TREND_UP
     assert state.last_higher_low is not None               # ratcheting structure
 
@@ -76,14 +82,31 @@ def test_range_day_when_no_break():
 def test_structure_break_reevaluates(store):
     engine = DayStateEngine()
     candles = [candle(9, 15, 22590, 22600, 22580, 22595),
-               candle(9, 20, 22600, 22720, 22590, 22710),
-               candle(9, 25, 22705, 22730, 22700, 22725)]   # higher low held
-    state = engine.update(candles, pdh=22700.0, pdl=22500.0, spot=22720.0)
+               candle(9, 20, 22600, 22610, 22590, 22605),
+               candle(9, 25, 22605, 22610, 22595, 22600),
+               candle(9, 30, 22600, 22605, 22590, 22595),
+               candle(9, 35, 22595, 22600, 22580, 22585),
+               candle(9, 40, 22590, 22595, 22570, 22575),
+               candle(10, 20, 22610, 22640, 22600, 22630),   # 1st close > 1h high
+               candle(10, 25, 22630, 22650, 22625, 22645),   # 2nd close -> TREND-UP
+               candle(10, 30, 22645, 22655, 22640, 22650)]   # higher low held
+    state = engine.update(candles, spot=22650.0)
     assert state.state == TREND_UP and state.structure_intact
-    # next candle closes below the last higher low -> structure breaks
-    candles.append(candle(9, 30, 22700, 22705, 22600, 22610))
-    state = engine.update(candles, pdh=22700.0, pdl=22500.0, spot=22610.0)
-    assert state.structure_intact is False and state.state == RANGE
+    # two consecutive closes back INSIDE the first-hour range -> back to RANGE
+    candles.append(candle(10, 35, 22600, 22605, 22592, 22596))
+    candles.append(candle(10, 40, 22596, 22602, 22590, 22595))
+    state = engine.update(candles, spot=22595.0)
+    assert state.state == RANGE
+    # BUG-1 proof: the transition log carries timestamp + boundary for both flips
+    kinds = [t[1] for t in state.transitions]
+    assert "RANGE -> TREND-UP" in kinds and "TREND-UP -> RANGE" in kinds
+    # and two closes beyond the OPPOSITE boundary would flip TREND-UP->TREND-DOWN
+    candles.append(candle(10, 45, 22595, 22597, 22562, 22565))
+    candles.append(candle(10, 50, 22565, 22568, 22550, 22555))
+    state = engine.update(candles, spot=22555.0)
+    assert state.state == TREND_DOWN and state.broken_level == 22570.0
+    kinds = [t[1] for t in state.transitions]
+    assert "TREND-UP -> RANGE" in kinds and "RANGE -> TREND-DOWN" in kinds
 
 
 # --- B. bonus scoring ------------------------------------------------------------

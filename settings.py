@@ -160,6 +160,8 @@ PROFIT_LOCK_R = 2.0                   # day total reaches +2R -> bank it, stop t
 # --- Room-to-run gate + dynamic budget (Trend-Day v2.1, frozen) ---
 ROOM_TO_RUN_MIN_PTS = 25              # runway to the nearest significant wall: >= 25 pts
 WALL_OI_MIN = 100000                  # significant wall: OI > 100k
+WALL_VELOCITY_MIN = 15000             # wall = change-in-OI velocity >= +15k across the last 2-3 polls
+                                      # (day-cumulative OI is context only, NEVER the gate)
 LEVEL_CONFLUENCE_PCT = 0.001          # strong wall aligns with structure within 0.1%
 LEVEL_TEST_TOLERANCE_PTS = 5          # touch band used to identify a tested/held level
 LEVEL_APPROACH_PTS = 25               # alert/decision radius around ladder levels
@@ -185,6 +187,18 @@ BUDGET_RANGE = 2                      # entries on RANGE days (unknown state -> 
 COOLDOWN_TREND_SEC = 1200             # 20 min between entries on trend days
 COOLDOWN_RANGE_SEC = 1800             # 30 min on range days
 CONSECUTIVE_LOSS_HALT = 2             # 2 consecutive full losses -> shutdown for day
+FULL_LOSS_R = -0.99                   # a "full loss" = -1R or worse
+
+# --- News gate (best effort; confirm-then-execute) ---
+NEWS_SOURCES = [
+    "https://www.moneycontrol.com/rss/marketreports.xml",
+    "https://www.moneycontrol.com/rss/business.xml",
+]
+NEWS_BLOCK_MINUTES = 30               # high-impact headline newer than this blocks entries
+NEWS_CHECK_INTERVAL_SEC = 300         # refresh headlines every 5 min
+NEWS_BLOCK_KEYWORDS = ("rbi", "repo", "cpi", "inflation", "gdp", "fed", "fomc",
+                       "rate cut", "rate hike", "budget", "election", "war",
+                       "sanction", "emergency", "crash", "surge", "ban ")
 FULL_LOSS_R = -0.99                   # a "full loss" = -1R or worse
 
 # --- MTF scalp (1m zone + 5m confirmation) ---

@@ -171,6 +171,52 @@ def build_eod_body(store, today_iso: str, regime_summary: str | None,
             lines.append(f"• {t['trade_id']} [{t['bucket']}] actual "
                          f"{t['actual_r']:+.2f}R | shadow {t['shadow_r']:+.2f}R | "
                          f"SAVED Rs {t['saved']:,.0f} | COST Rs {t['cost']:,.0f}")
+    # SKIPS - saved vs cost (decision transparency): simulate every >=80-score
+    # skipped setup (entry at the skip close, SL + entry+-1R/2R targets, spot-R
+    # model) to 15:10. SAVED = the loss avoided by not taking it; COST = the
+    # profit missed.
+    skips = []
+    skip_rows = store.conn.execute(
+        "SELECT ts, trade_id, direction, spot, score, reasons_json, notes FROM "
+        "journal WHERE type = 'SKIP' AND reasons_json LIKE '%skipped%' AND "
+        "score >= ? AND substr(ts, 1, 10) = ? ORDER BY id",
+        (settings.ENTRY_SCORE_FIRE, today_iso)).fetchall()
+    for ts, trade_id, direction, spot_v, score, reasons_json, notes in skip_rows:
+        try:
+            skipped = (json.loads(reasons_json or "{}") or {}).get("skipped") or {}
+        except ValueError:
+            continue
+        entry_spot, sl = skipped.get("entry_spot"), skipped.get("sl_spot")
+        if None in (entry_spot, sl) or not entry_spot or entry_spot == sl:
+            continue
+        risk = abs(entry_spot - sl)
+        t1 = entry_spot + risk if direction == "LONG" else entry_spot - risk
+        t2 = entry_spot + 2 * risk if direction == "LONG" else entry_spot - 2 * risk
+        sim = _simulate_shadow({"direction": direction, "entry_spot": entry_spot,
+                                "entry_prem": entry_spot, "sl_spot": sl,
+                                "orig_tgt1": t1, "orig_tgt2": t2},
+                               [c for c in _candles_for(store.conn, today_iso)
+                                if c["start"] >= datetime.fromisoformat(ts)])
+        if sim is None:
+            continue
+        saved = max(0.0, -sim["points"]) * settings.LOT_SIZE
+        cost = max(0.0, sim["points"]) * settings.LOT_SIZE
+        skips.append({"trade_id": trade_id or f"skip-{ts[11:16]}", "score": score,
+                      "bucket": _shadow_bucket(notes.split(":")[0], "OI-N/A"),
+                      "actual_r": 0.0, "shadow_r": sim["r"],
+                      "saved": saved, "cost": cost,
+                      "direction": direction, "notes": notes})
+    if skips:
+        lines += ["", "SKIPS - SAVED vs COST (would-have-done, spot-R model)"]
+        for t in skips:
+            lines.append(f"• {t['trade_id']} {t['direction']} score {t['score']} | "
+                         f"shadow {t['shadow_r']:+.2f}R (spot model) | "
+                         f"SAVED Rs {t['saved']:,.0f} | COST Rs {t['cost']:,.0f}")
+        skip_saved = sum(t["saved"] for t in skips)
+        skip_cost = sum(t["cost"] for t in skips)
+        lines.append(f"• SKIPS TOTAL: SAVED Rs {skip_saved:,.0f} | "
+                     f"COST Rs {skip_cost:,.0f}")
+
     totals = shadow_report(store.conn)
     bucket_lines = []
     for bucket in ("hard-SL", "thesis", "OI-strong", "OI-moderate", "time", "other"):

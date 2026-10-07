@@ -49,7 +49,10 @@ class MarketDataStore:
         self.liquidity = None
         self.trade_expiry = None
         self.trade_expiry_days = None
+        self.chain_poll_ts: str | None = None   # last chain ATTEMPT (BUG-3)
         self.last_refresh: str | None = None
+        self.news: list = []             # recent headlines (news gate)
+        self.news_checked: float | None = None
         self.health = FeedHealth(settings.FEED_FAILURE_ALERT_THRESHOLD)
 
     @property
@@ -154,6 +157,7 @@ class MarketDataStore:
         # 2) option chain - validated BEFORE anything consumes it
         raw, _http, tried = (fetch_option_chain_with_retries(self._session)
                              if self._session else (None, None, []))
+        self.chain_poll_ts = ist_now().isoformat(timespec="seconds")
         self.chain_tried = tried
         snapshot = None
         if raw is not None:
@@ -204,6 +208,15 @@ class MarketDataStore:
                 pdh=self.pdh, pdl=self.pdl, ts=snapshot.raw_ts if snapshot else None,
                 pcr_total=self.chain.pcr_total)
 
+        # news gate refresh (every NEWS_CHECK_INTERVAL_SEC; graceful on failure)
+        due_news = self.news_checked is None or             (datetime.now(tz=settings.IST).timestamp() - self.news_checked)
+        if due_news is None or due_news >= settings.NEWS_CHECK_INTERVAL_SEC:
+            try:
+                from data_sources.news import fetch_headlines
+                self.news = fetch_headlines(self._session)
+                self.news_checked = datetime.now(tz=settings.IST).timestamp()
+            except Exception as exc:
+                log.warning("news fetch failed: %s", exc)
         self.last_refresh = iso
         return status
 

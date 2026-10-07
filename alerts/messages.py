@@ -150,3 +150,7 @@ def data_mismatch(detail: str) -> str:
 
 def trading_halted(reason: str) -> str:
     return f"🛑 TRADING HALTED — {reason}"
+
+
+def skipped_alert(*, side: str, level: str, reason: str, score) -> str:
+    return f"🚫 SKIPPED: {side} break {level} | reason: {reason} | score {score}"

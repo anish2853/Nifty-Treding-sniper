@@ -1,23 +1,26 @@
-"""Day-State Engine (Trend-Day v2, module A) - replaces rigid clock windows.
+"""Day-State Engine v2 (symmetric rebuild - BUG-1 fix).
 
-Computed from the store's closed 5-min candles on every cycle:
-  VWAP        - volume-weighted when candle volume exists; otherwise the
-                cumulative typical-price average, tagged VWAP-proxy.
-  EMA-20      - on 5-min closes.
-  Liquidity break - the FIRST 5-min close beyond PDH/PDL (one per side per day).
-  Structure   - ratcheting higher lows (LONG side) / lower highs (SHORT side);
-                a 5-min close beyond the structure level breaks it and the state
-                re-evaluates.
-  Day state   - TREND-UP: PDH broken + closes holding above it + spot > VWAP.
-                TREND-DOWN: mirror. RANGE: everything else (whipsawing VWAP).
+A full symmetric state machine over the FIRST-HOUR RANGE (09:15-10:15 high/low),
+re-evaluated on EVERY 5-min close, every transition logged with timestamp and
+boundary:
+  RANGE -> TREND-UP     2 consecutive closes above the first-hour range high
+  RANGE -> TREND-DOWN   2 consecutive closes below the first-hour range low
+  TREND-* -> RANGE      2 consecutive closes back inside the range
+  TREND-UP <-> TREND-DOWN  2 consecutive closes beyond the OPPOSITE boundary
+
+Also computes: VWAP (proxy when index volume missing), EMA-20, ORB-mid bias
+(below mid after the first hour -> PE-preferred; above -> CE-preferred), and
+ratcheting structure (higher lows / lower highs) for the OI-whispers trail.
+PDH/PDL remain as liquidity-map context, never the state gate.
 
 Entry permissions (enforced in main): TREND - entries 09:30-14:30 while structure
 holds; RANGE - sweep-fade at extremes only, no breakout entries; the clock
-governs only the FIRST attempt at PDH/PDL - after a liquidity break STRUCTURE
-governs. No new entries after 14:30. Square-off 15:10 unchanged.
+governs only the FIRST attempt - after a break STRUCTURE governs. No new entries
+after 14:30. Square-off 15:10 unchanged.
 """
 import logging
 from dataclasses import dataclass, field
+from datetime import time as dt_time
 
 import settings
 
@@ -31,15 +34,20 @@ RANGE = "RANGE"
 @dataclass
 class DayState:
     state: str = RANGE
+    first_hour_high: float | None = None
+    first_hour_low: float | None = None
     vwap: float | None = None
     vwap_proxy: bool = False
     ema20: float | None = None
-    broken_level: float | None = None   # PDH/PDL whose break opened the trend
+    orb_mid: float | None = None        # session bias pivot (ORB mid)
+    bias: str | None = None             # CE-preferred / PE-preferred (after hour 1)
+    broken_level: float | None = None   # boundary whose break opened the trend
     broken_side: str | None = None      # 'UP' | 'DOWN'
     structure_intact: bool = True
-    last_higher_low: float | None = None   # LONG structure trail anchor
-    last_lower_high: float | None = None   # SHORT structure trail anchor
+    last_higher_low: float | None = None
+    last_lower_high: float | None = None
     notes: list = field(default_factory=list)
+    transitions: list = field(default_factory=list)   # [(ts, "A->B", boundary)]
 
     def as_ctx(self) -> dict:
         return {"state": self.state, "structure_intact": self.structure_intact,
@@ -48,40 +56,114 @@ class DayState:
 
     def summary(self) -> str:
         vwap = f"{self.vwap:.2f}" if self.vwap is not None else "MISSING"
-        proxy = " (proxy)" if self.vwap_proxy else ""
         ema = f"{self.ema20:.2f}" if self.ema20 is not None else "MISSING"
-        broken = f"{self.broken_level:.2f}" if self.broken_level is not None else "-"
-        return (f"{self.state} | VWAP {vwap}{proxy} | EMA20 {ema} | "
-                f"liq-break {broken} | structure "
+        rng = (f"{self.first_hour_low:.2f}-{self.first_hour_high:.2f}"
+               if self.first_hour_low is not None else "unlocked")
+        bias = self.bias or "-"
+        return (f"{self.state} | 1h-range {rng} | VWAP {vwap}"
+                f"{' (proxy)' if self.vwap_proxy else ''} | EMA20 {ema} | "
+                f"bias {bias} | structure "
                 f"{'intact' if self.structure_intact else 'BROKEN'}")
 
 
 class DayStateEngine:
+    """Full symmetric state machine (BUG-1 fix): every 5-min close is evaluated;
+    2 consecutive closes beyond/inside a boundary flip the state; every
+    transition is recorded with timestamp + boundary."""
+
     def __init__(self):
         self.state = DayState()
 
-    def update(self, candles, pdh, pdl, spot) -> DayState:
+    def update(self, candles, spot, orb_mid=None, pdh=None, pdl=None) -> DayState:
         state = self.state
+        if orb_mid is not None:
+            state.orb_mid = float(orb_mid)
         if candles:
             self._update_vwap_ema(candles)
-        # liquidity break: the FIRST 5-min close beyond PDH/PDL
-        if candles and state.broken_level is None:
-            for c in candles:
-                if pdh is not None and c.close > pdh:
-                    state.broken_level, state.broken_side = float(pdh), "UP"
-                    state.notes.append(f"liquidity break: close {c.close:.2f} "
-                                       f"above PDH {pdh:.2f}")
-                    log.info("liquidity break UP at %s (close %.2f > PDH %.2f)",
-                             c.start.strftime("%H:%M"), c.close, pdh)
-                    break
-                if pdl is not None and c.close < pdl:
-                    state.broken_level, state.broken_side = float(pdl), "DOWN"
-                    state.notes.append(f"liquidity break: close {c.close:.2f} "
-                                       f"below PDL {pdl:.2f}")
-                    log.info("liquidity break DOWN at %s (close %.2f < PDL %.2f)",
-                             c.start.strftime("%H:%M"), c.close, pdl)
-                    break
-        # structure: ratcheting higher lows / lower highs
+        self._lock_first_hour(candles)
+        self._update_structure(candles)
+
+        # ---- symmetric transitions on consecutive closes (BUG-1 fix) ----
+        if candles and state.first_hour_high is not None:
+            high, low = state.first_hour_high, state.first_hour_low
+            last_ts = candles[-1].start
+            above = self._consecutive(candles, lambda c: c.close > high)
+            below = self._consecutive(candles, lambda c: c.close < low)
+            inside = self._consecutive(candles, lambda c: low <= c.close <= high)
+
+            def flip(new_state, boundary):
+                old = state.state
+                if old == new_state:
+                    return
+                state.state = new_state
+                state.broken_level = boundary
+                state.broken_side = "UP" if new_state == TREND_UP else \
+                    "DOWN" if new_state == TREND_DOWN else state.broken_side
+                state.structure_intact = True
+                self._record(f"{old} -> {new_state}", boundary, last_ts)
+
+            if state.state == RANGE:
+                if above >= 2:
+                    flip(TREND_UP, high)           # <- existed before
+                elif below >= 2:
+                    flip(TREND_DOWN, low)          # <- BUG-1: this was missing
+            elif state.state == TREND_UP:
+                if below >= 2:
+                    flip(TREND_DOWN, low)          # opposite boundary
+                elif inside >= 2:
+                    flip(RANGE, high)              # back inside
+            elif state.state == TREND_DOWN:
+                if above >= 2:
+                    flip(TREND_UP, high)           # opposite boundary
+                elif inside >= 2:
+                    flip(RANGE, low)               # back inside
+
+        # ORB-mid bias after the first hour (feeds permissions + review)
+        if candles and state.orb_mid is not None:
+            now_t = candles[-1].start.time()
+            open_mins = settings.MARKET_OPEN.hour * 60 + settings.MARKET_OPEN.minute
+            first_hour_end = dt_time((open_mins + 60) // 60, (open_mins + 60) % 60)
+            if now_t >= first_hour_end and spot is not None:
+                state.bias = "CE-preferred" if spot > state.orb_mid \
+                    else "PE-preferred" if spot < state.orb_mid else state.bias
+        return state
+
+    # -- helpers -------------------------------------------------------------
+    @staticmethod
+    def _consecutive(candles, predicate) -> int:
+        count = 0
+        for candle in reversed(candles):
+            if predicate(candle):
+                count += 1
+            else:
+                break
+        return count
+
+    def _record(self, transition: str, boundary: float | None, ts) -> None:
+        self.state.transitions.append(
+            (ts.isoformat(timespec="seconds"), transition,
+             round(boundary, 2) if boundary is not None else None))
+        log.info("day state %s @ %s (boundary %s)", transition,
+                 ts.strftime("%H:%M"), boundary)
+
+    def _lock_first_hour(self, candles) -> None:
+        state = self.state
+        if state.first_hour_high is not None or not candles:
+            return
+        open_mins = settings.MARKET_OPEN.hour * 60 + settings.MARKET_OPEN.minute
+        end_h, end_m = divmod(open_mins + 60, 60)
+        first_hour = [c for c in candles
+                      if dt_time(open_mins // 60, open_mins % 60)
+                      <= c.start.time() < dt_time(end_h, end_m)]
+        hour_done = candles[-1].start.time() >= dt_time(end_h, end_m)
+        if len(first_hour) >= 3 or (hour_done and first_hour):
+            state.first_hour_high = max(c.high for c in first_hour)
+            state.first_hour_low = min(c.low for c in first_hour)
+            log.info("first-hour range locked: %.2f-%.2f (%d candles)",
+                     state.first_hour_high, state.first_hour_low, len(first_hour))
+
+    def _update_structure(self, candles) -> None:
+        state = self.state
         if len(candles) >= 2:
             prev, last = candles[-2], candles[-1]
             if last.low > prev.low and (state.last_higher_low is None
@@ -90,33 +172,6 @@ class DayStateEngine:
             if last.high < prev.high and (state.last_lower_high is None
                                           or last.high < state.last_lower_high):
                 state.last_lower_high = float(last.high)
-        # structure-breaking close -> re-evaluate
-        if candles:
-            last_close = candles[-1].close
-            if state.broken_side == "UP" and state.last_higher_low is not None \
-                    and last_close < state.last_higher_low:
-                if state.structure_intact:
-                    state.structure_intact = False
-                    state.notes.append(f"structure-breaking close {last_close:.2f} "
-                                       f"< last higher low "
-                                       f"{state.last_higher_low:.2f} - re-evaluating")
-                    log.info("structure break (UP): close %.2f < higher low %.2f",
-                             last_close, state.last_higher_low)
-            elif state.broken_side == "DOWN" and state.last_lower_high is not None \
-                    and last_close > state.last_lower_high:
-                if state.structure_intact:
-                    state.structure_intact = False
-                    state.notes.append(f"structure-breaking close {last_close:.2f} "
-                                       f"> last lower high "
-                                       f"{state.last_lower_high:.2f} - re-evaluating")
-                    log.info("structure break (DOWN): close %.2f > lower high %.2f",
-                             last_close, state.last_lower_high)
-            elif not state.structure_intact:
-                # closes recovered beyond the structure level -> intact again
-                state.structure_intact = True
-                state.notes.append("structure recovered - state re-evaluated intact")
-        state.state = self._classify(candles, spot)
-        return state
 
     def _update_vwap_ema(self, candles) -> None:
         any_volume = any(c.volume for c in candles)
@@ -138,20 +193,3 @@ class DayStateEngine:
         for close in closes[1:]:
             ema = close * k + ema * (1 - k)
         self.state.ema20 = ema
-
-    def _classify(self, candles, spot) -> str:
-        state = self.state
-        if not candles or state.broken_level is None or state.vwap is None:
-            return RANGE
-        last_close = candles[-1].close
-        if state.broken_side == "UP":
-            holding = last_close >= state.broken_level
-            above_vwap = spot is not None and spot > state.vwap
-            if holding and above_vwap and state.structure_intact:
-                return TREND_UP
-        elif state.broken_side == "DOWN":
-            holding = last_close <= state.broken_level
-            below_vwap = spot is not None and spot < state.vwap
-            if holding and below_vwap and state.structure_intact:
-                return TREND_DOWN
-        return RANGE
