@@ -1,21 +1,21 @@
 # 60-Day Replay Report
 
 **MODE**: PRICE-ONLY VARIANT | threshold: 52/65
-**Period**: 2026-10-07 → 2026-10-07
-**Days Replayed**: 1 / 34 days
+**Period**: 2026-10-07 to 2026-10-07
+**Days Replayed**: 1 / 46 days
 
 ## Headline Results
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | 34 |
-| Win Rate | 26.5% (9W / 25L) |
-| Avg Win (R) | +1.46R |
-| Avg Loss (R) | -2.30R |
-| Expectancy (R) | -1.30R per trade |
-| Expectancy (₹) | ₹-13305 (-391₹/trade after ₹150 cost) |
-| Max Drawdown | -49.27R |
-| Longest Streak | 8 losses |
+| Total Trades | 46 |
+| Win Rate | 32.6% (15W / 31L) |
+| Avg Win (R) | +1.51R |
+| Avg Loss (R) | -2.41R |
+| Expectancy (R) | -1.13R per trade |
+| Expectancy (₹) | ₹-15628 (-340₹/trade after ₹150 cost) |
+| Max Drawdown | -61.93R |
+| Longest Streak | 12 losses |
 
 ## Gates
 
@@ -33,13 +33,13 @@
 
 | Metric | Value |
 |--------|-------|
-| Trades | 28 |
-| Win Rate | 28.6% |
-| Avg Win | +1.49R |
-| Avg Loss | -2.33R |
-| Expectancy | -1.24R |
-| Max Streak | 9 |
-| Total R | -34.69R |
+| Trades | 40 |
+| Win Rate | 35.0% |
+| Avg Win | +1.54R |
+| Avg Loss | -2.46R |
+| Expectancy | -1.06R |
+| Max Streak | 12 |
+| Total R | -42.44R |
 
 ### MTF-SCALP
 
@@ -59,10 +59,10 @@
 
 | Metric | Value |
 |--------|-------|
-| Trades | 34 |
-| Win Rate | 26.5% |
-| Expectancy | -1.30R |
-| Total R | -44.35R |
+| Trades | 46 |
+| Win Rate | 32.6% |
+| Expectancy | -1.13R |
+| Total R | -52.09R |
 
 ## By Direction (Symmetry Check)
 
@@ -70,19 +70,19 @@
 
 | Metric | Value |
 |--------|-------|
-| Trades | 8 |
-| Win Rate | 37.5% |
-| Expectancy | -0.63R |
-| Total R | -5.01R |
+| Trades | 11 |
+| Win Rate | 54.5% |
+| Expectancy | -0.03R |
+| Total R | -0.36R |
 
 ### SHORT
 
 | Metric | Value |
 |--------|-------|
-| Trades | 26 |
-| Win Rate | 23.1% |
-| Expectancy | -1.51R |
-| Total R | -39.34R |
+| Trades | 35 |
+| Win Rate | 25.7% |
+| Expectancy | -1.48R |
+| Total R | -51.73R |
 
 ## By Month
 
@@ -99,15 +99,15 @@
 
 | Metric | Value |
 |--------|-------|
-| Trades | 23 |
-| Win Rate | 30.4% |
-| Expectancy | -1.20R |
-| Total R | -27.55R |
+| Trades | 35 |
+| Win Rate | 37.1% |
+| Expectancy | -1.01R |
+| Total R | -35.30R |
 
 ## Cost Impact
 
 - **Cost per trade**: ₹150
-- **Total cost**: ₹5100
+- **Total cost**: ₹6900
 - **Impact on expectancy**: ~₹150₹/trade (already deducted in results above)
 
 ## Notes

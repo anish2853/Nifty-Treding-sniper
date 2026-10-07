@@ -1714,7 +1714,7 @@ def main():
         # Generate markdown report with cost deduction
         report_path = Path(settings.DATA_DIR.parent) / "backtest_results" / "replay60_report.md"
         markdown_report = generate_replay_report(session, str(report_path))
-        print(f"\n✓ Detailed report saved: {report_path}")
+        print(f"\n[OK] Detailed report saved: {report_path}")
         print(f"\n{markdown_report[:500]}...\n")
         
         # Optional: send Telegram summary (if configured)

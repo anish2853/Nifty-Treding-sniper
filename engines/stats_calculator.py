@@ -313,7 +313,7 @@ class StatsCalculator:
         report = f"""# 60-Day Replay Report
 
 **MODE**: PRICE-ONLY VARIANT | threshold: 52/65
-**Period**: {self.session.start_date} → {self.session.end_date}
+**Period**: {self.session.start_date} to {self.session.end_date}
 **Days Replayed**: {self.session.days_replayed} / {len(self.trades) if self.trades else 0} days
 
 ## Headline Results

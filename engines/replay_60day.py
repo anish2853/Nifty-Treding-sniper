@@ -56,7 +56,7 @@ class ReplaySession:
 
     def summary(self) -> str:
         return (
-            f"Replay {self.start_date} → {self.end_date} | "
+            f"Replay {self.start_date} to {self.end_date} | "
             f"{self.days_replayed} days | {self.total_trades} trades | "
             f"Win rate {self.win_rate():.1f}% | Expectancy {self.expectancy():+.2f}R | "
             f"Max DD {self.max_dd:+.2f}R"
