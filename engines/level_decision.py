@@ -15,6 +15,7 @@ class LevelEvent:
     direction: str | None = None
     message: str = ""
     zone: MTFZone | None = None
+    is_significant: bool = True
 
 
 @dataclass
@@ -159,8 +160,15 @@ class LevelDecisionEngine:
                 else:
                     groups[-1].append(level)
             for group in groups:
-                low = min(level.price for level in group)
-                high = max(level.price for level in group)
+                raw_low = min(level.price for level in group)
+                raw_high = max(level.price for level in group)
+                if (raw_high - raw_low) < 5.0:
+                    mid = (raw_low + raw_high) / 2.0
+                    low = mid - 2.5
+                    high = mid + 2.5
+                else:
+                    low = raw_low
+                    high = raw_high
                 distance = max(low - spot, spot - high, 0)
                 key = ",".join(sorted(level.level_id for level in group))
                 state = self._watch_state.setdefault(
@@ -175,9 +183,9 @@ class LevelDecisionEngine:
                 if distance > settings.LEVEL_APPROACH_PTS:
                     continue
                 last_alert = state["last_alert"]
+                cooldown_sec = max(1800, getattr(settings, "LEVEL_WATCH_COOLDOWN_SEC", 1800))
                 cooled = (last_alert is None or
-                          (now - last_alert).total_seconds()
-                          >= settings.LEVEL_WATCH_COOLDOWN_SEC)
+                          (now - last_alert).total_seconds() >= cooldown_sec)
                 eligible = last_alert is None or (cooled and state["returned"])
                 if not eligible:
                     continue
@@ -187,20 +195,43 @@ class LevelDecisionEngine:
                     if oi_levels else None
                 oi_read = _watch_oi_bias(oi, side)
                 names = _zone_sources(group)
+
+                # Zone Significance Filter:
+                # 1) PDH/PDL/ORB anchor
+                has_anchor = any(
+                    any(anchor in str(getattr(lvl, "label", "")) or anchor in str(getattr(lvl, "level_id", ""))
+                        for anchor in ("PDH", "PDL", "ORB", "OPENING"))
+                    or getattr(lvl, "strong", False)
+                    for lvl in group
+                )
+                # 2) OI wall > 100k
+                has_large_oi = False
+                if oi is not None:
+                    oi_chg = abs(getattr(oi, "change_oi", 0) or 0)
+                    oi_tot = getattr(oi, "oi", 0) or getattr(oi, "total_oi", 0) or 0
+                    if oi_chg >= 100000 or oi_tot >= 100000:
+                        has_large_oi = True
+                # 3) Tested and rejected today (>= 1 prior candle stop at the level)
+                has_rejection = any(
+                    getattr(lvl, "touches", 0) >= 1 or getattr(lvl, "tested", False)
+                    for lvl in group
+                )
+                is_significant = has_anchor or has_large_oi or has_rejection
+
                 label = "SUPPORT ZONE" if side == "S" else "RESISTANCE ZONE"
                 message = (f"{label} {low:,.0f}-{high:,.0f} ({names}) | "
                            f"price {spot:,.0f} | {oi_read}")
                 event_id = f"{label}:{low:.2f}-{high:.2f}@{now.isoformat(timespec='seconds')}"
-                candidates.append((distance, key, event_id, label, low, message, state))
+                candidates.append((distance, key, event_id, label, low, message, state, is_significant))
 
         if not candidates:
             return []
-        _distance, key, level_id, label, price, message, state = min(
+        _distance, key, level_id, label, price, message, state, is_sig = min(
             candidates, key=lambda item: item[0])
         state["last_alert"] = now
         state["left_far"] = False
         state["returned"] = False
-        return [LevelEvent("LEVEL-WATCH", level_id, label, price, message=message)]
+        return [LevelEvent("LEVEL-WATCH", level_id, label, price, message=message, is_significant=is_sig)]
 
     def on_minute(self, candle, levels, day_state: str, previous=None,
                   broken_level=None, vwap=None) -> list[LevelEvent]:
@@ -215,16 +246,20 @@ class LevelDecisionEngine:
             swept_down = level.side == "S" and candle.low < level.price \
                 and candle.close > level.price
             if swept_up or swept_down:
+                # REQUIREMENT 4a: SWEEP-FADE ONLY on STRONG levels (PDH/PDL/OI-wall confluence)
+                # Skip fades at minor swing levels
+                if not level.strong:
+                    continue
                 direction = "SHORT" if swept_up else "LONG"
                 zone = MTFZone(
-                    zone_id=f"FADE-{level.level_id}-{candle.start.isoformat()}",
+                    zone_id=f"SWEEP-FADE-{level.level_id}-{candle.start.isoformat()}",
                     direction=direction, formed_at=candle.start,
                     trigger=float(candle.low if swept_up else candle.high),
                     stop=float(candle.high if swept_up else candle.low),
                     broken_level=float(level.price), vwap=float(level.price))
-                events.append(LevelEvent("FADE-ZONE", level.level_id, level.label,
+                events.append(LevelEvent("SWEEP-FADE-ZONE", level.level_id, level.label,
                                          level.price, direction,
-                                         "1m sweep rejected; awaiting 5m confirmation",
+                                         "1m sweep of STRONG level rejected; awaiting 5m confirmation",
                                          zone))
                 continue
             broke_up = level.side == "R" and candle.close > level.price

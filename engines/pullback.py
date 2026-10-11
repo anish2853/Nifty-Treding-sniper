@@ -55,13 +55,16 @@ class PullbackEngine:
 
     @staticmethod
     def _levels(ctx) -> list:
-        """Pullback candidates: the broken liquidity level first, then VWAP."""
+        """Pullback candidates: broken liquidity level, then EQ midline, then VWAP."""
         day_state = ctx.get("day_state") or {}
         levels = []
         if day_state.get("broken_level") is not None:
             name = "broken PDH" if day_state.get("broken_side") == "UP" \
                 else "broken PDL"
             levels.append((day_state["broken_level"], name))
+        eq = day_state.get("eq") or ctx.get("eq")
+        if eq is not None:
+            levels.append((float(eq), "EQ"))
         if ctx.get("vwap") is not None:
             levels.append((ctx["vwap"], "VWAP" + (" (proxy)" if ctx.get("vwap_proxy") else "")))
         return levels
@@ -92,13 +95,30 @@ class PullbackEngine:
         if not self.window_ok(candle) or not day_state:
             return []
         state = day_state.get("state")
-        if state not in ("TREND-UP", "TREND-DOWN"):
-            return []                       # pullbacks exist only on trend days
+        eq_val = day_state.get("eq")
+        if state not in ("TREND-UP", "TREND-DOWN") and eq_val is None:
+            return []                       # pullbacks exist only on trend days or EQ retests
         spot = ctx.get("spot") or candle.close
         vwap = ctx.get("vwap")
         out = []
         for level, label in self._levels(ctx):
-            if state == "TREND-UP":
+            if label == "EQ" and state not in ("TREND-UP", "TREND-DOWN"):
+                # EQ retest in RANGE: test from above = LONG, test from below = SHORT
+                if candle.low <= level <= candle.high or (candle.low <= level < candle.close):
+                    direction = "LONG"
+                    touched = True
+                    rejection = candle.close > level and candle.close > candle.open
+                    depth = candle.close - level
+                    vwap_hold = vwap is not None and spot > vwap
+                elif candle.high >= level >= candle.low or (candle.high >= level > candle.close):
+                    direction = "SHORT"
+                    touched = True
+                    rejection = candle.close < level and candle.close < candle.open
+                    depth = level - candle.close
+                    vwap_hold = vwap is not None and spot < vwap
+                else:
+                    continue
+            elif state == "TREND-UP":
                 direction = "LONG"
                 touched = candle.low <= level <= candle.high or \
                     (candle.low <= level < candle.close)
@@ -143,10 +163,11 @@ class PullbackEngine:
             ev.reasons.append(("VWAP/structure hold", vwap_ok,
                                settings.W_REGIME_VIX if vwap_ok else 0,
                                f"vwap hold {vwap_hold}, structure {structure_intact}"))
-            trend_ok = state in ("TREND-UP", "TREND-DOWN") and structure_intact
-            ev.reasons.append(("trend intact", trend_ok,
+            trend_ok = (state in ("TREND-UP", "TREND-DOWN") or label == "EQ") and structure_intact
+            ev.trend_intact = trend_ok
+            ev.reasons.append(("trend/EQ hold intact", trend_ok,
                                settings.W_REGIME_VIX if trend_ok else 0,
-                               f"day state {state}"))
+                               f"day state {state}, label {label}"))
             ev.volume_state, ev.volume_detail = volume_state_for(
                 candle, ctx.get("candle_engine"))
             ev.reasons.append(("volume on the pullback candle",

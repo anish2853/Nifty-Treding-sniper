@@ -25,7 +25,7 @@ import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
 from alerts import messages
@@ -48,6 +48,9 @@ from engines.mtf_live import (MTF_FAMILIES, coil_viz_payload, compute_mtf_tgt1,
 from engines.replay_mtf import run_replay_mtf
 from engines.oi_engine import recent_oi_net, spot_adjacent
 from engines.pullback import PullbackEngine
+from engines.order_blocks import OrderBlockEngine
+from engines.short_gating import evaluate_short_gate, get_trades_expectancy
+from engines.sweep_mss_poi import SweepMssPoiEngine, get_sweep_ab_stats
 from engines.paper import PaperTrade
 from engines.regime import Regime, RegimeClassifier, RegimeState
 from engines.sweep import SweepEngine
@@ -55,6 +58,13 @@ from journal.decision_audit import emit_nearmiss_report
 from engines.second_stage import SecondStageEngine
 from journal import stats
 from journal.store import JournalStore
+from data_sources.snapshot import MarketSnapshot, MarketSnapshotBuilder
+from engines.levels_lifecycle import LevelLifecycleManager, LevelRole, LevelStatus
+from engines.strategies import S1TrendExpansion, S2VwapMomentum, S3LiquidityReversal
+from engines.arbiter import Arbiter, RiskGovernor
+from engines.position_manager import PositionManager, TradeStateEnum, ExitClassification
+from engines.shadow_ledger import ShadowLedger
+from engines.execution_router import get_execution_router
 import premarket_report
 import settings
 from utils import fmt_num, ist_now, load_date_set, safe_print, setup_logging
@@ -216,7 +226,8 @@ class DaySession:
 
     def __init__(self, store: JournalStore, tg: TelegramSender,
                  classifier: RegimeClassifier, event_day: bool, today_iso: str,
-                 market: MarketDataStore, holidays=None, data_source: str = "live-chain"):
+                 market: MarketDataStore, holidays=None, data_source: str = "live-chain",
+                 live_mode: bool = False):
         self.store = store
         self.tg = tg
         self.classifier = classifier
@@ -225,6 +236,8 @@ class DaySession:
         self.market = market
         self.holiday_dates = holidays or set()
         self.data_source = data_source
+        self.live_mode = live_mode
+        self.legacy_execution_enabled = not live_mode
         self.entry = EntryEngine(market.journal)
         self.exit_engine = ExitEngine(market.journal)
         self.sweeps = SweepEngine(market.journal)
@@ -232,6 +245,8 @@ class DaySession:
         self.pullbacks = PullbackEngine(market.journal)
         self.level_runtime = LevelRuntime()
         self.coil_engine = CoilSnipeEngine()
+        self.ob_engine = OrderBlockEngine()
+        self.sweep_mss_poi = SweepMssPoiEngine()
         self.day_state_engine = DayStateEngine()
         self._fired_mtf_keys: set[str] = set()
         self.day_state = None            # DayState | None (Trend-Day v2)
@@ -251,13 +266,92 @@ class DaySession:
                                 "OPPOSITE_SIGNAL", "STRUCTURE_BREAK"}
         self._skip_alerts: dict = {}   # (family, direction) -> last 🚫 alert time
 
+        # Candle blindness detection & state (Phase 13.3 + 13.4 Outage Exit Protocol)
+        self.is_blind = False
+        self._last_blind_alert_time: datetime | None = None
+        self.blind_start_time: datetime | None = None
+        self.blind_incidents = 0
+        self.max_candle_lag = 0.0
+
+        # Session Preflight Status (Phase 13.5)
+        self.preflight_checked = False
+        self.preflight_status = {"status": "PENDING", "message": "Awaiting 09:20 preflight check"}
+        self.degraded_mode = False
+
+        # Regime spam suppression tracking
+        self._last_regime_classification: Regime | None = None
+        self._last_regime_alert_time: datetime | None = None
+        self._vix_spike_alerted = False
+
+        # PCR gate shadow tracker (measure, don't delete)
+        from engines.pcr_shadow import PCRShadowTracker
+        self.pcr_shadow_tracker = PCRShadowTracker()
+
+        # Shadow-Compliant Comparison Ledger (Phase 13.4)
+        from engines.shadow_compliant import ShadowCompliantLedger
+        self.shadow_compliant_ledger = ShadowCompliantLedger()
+
+        # Active Model A: Unified Liquidity & Fibonacci Sniper System
+        from engines.shadow_mw import ShadowMWEngine, UnifiedLiquiditySniper, dispatch_telegram_alert
+        self.shadow_mw = ShadowMWEngine(store=self.store, today_iso=self.today_iso)
+        self.sniper = UnifiedLiquiditySniper(
+            store=self.store,
+            today_iso=self.today_iso,
+            pdh=self.market.pdh,
+            pdl=self.market.pdl,
+            notifier=dispatch_telegram_alert,
+        )
+
+        # Phase 1-10 Unified Architectural Engines
+        self.snapshot_builder = MarketSnapshotBuilder()
+        self.level_lifecycle = LevelLifecycleManager()
+        self.s1_strategy = S1TrendExpansion()
+        self.s2_strategy = S2VwapMomentum()
+        self.s3_strategy = S3LiquidityReversal()
+        self.arbiter = Arbiter()
+        self.risk_governor = RiskGovernor()
+        self.position_manager = PositionManager()
+        self.shadow_ledger = ShadowLedger()
+        self.current_snapshot: MarketSnapshot | None = None
+        self.execution_router = get_execution_router()
+
+        # Single Live Decision Owner Guard:
+        # Direct execution via legacy fire() / _fire_mtf() is strictly disabled in live mode.
+        # Live trades can ONLY be created by S1/S2/S3 -> Arbiter -> RiskGovernor -> PositionManager.
+        self.legacy_execution_enabled = not self.live_mode
+
     # -- the ONE Telegram choke point ---------------------------------------------
-    def _notify(self, text: str) -> None:
-        if self.data_source == "live-chain":
-            self.tg.send(text)
-        else:
+    def _notify(
+        self,
+        text: str,
+        *,
+        event_id: str | None = None,
+        decision_hash: str | None = None,
+        severity: str = "INFO",
+        event_type: str | None = None,
+    ) -> None:
+        if self.data_source != "live-chain":
             log.info("telegram suppressed (data_source=%s): %.80s", self.data_source,
                      text.replace("\n", " | "))
+            return
+
+        # Suppress confident regime-change / day state messages while blind
+        if getattr(self, "is_blind", False):
+            if any(k in text for k in ("REGIME CHANGE", "DAY STATE", "TREND-UP", "TREND-DOWN", "VIX SPIKE")):
+                log.warning("Suppressed regime/state notification while candle engine is blind: %.80s",
+                            text.replace("\n", " | "))
+                return
+
+        if hasattr(self.tg, "send_event"):
+            self.tg.send_event(
+                text,
+                event_id=event_id,
+                decision_hash=decision_hash,
+                severity=severity,
+                event_type=event_type,
+            )
+        else:
+            self.tg.send(text)
 
     # -- regime gates ----------------------------------------------------------------
     def regime_allows(self, direction: str, level_name: str | None):
@@ -365,6 +459,61 @@ class DaySession:
             self.store.journal_event("SKIP", notes=marker)
             self._notify(messages.data_mismatch(reason))
 
+    def check_session_preflight(self, now: datetime | None = None) -> dict:
+        """Session preflight check at 09:20 daily (Phase 13.5).
+        
+        Verifies:
+        1. Chart API responds (or has candles)
+        2. Option chain responds (underlying spot available)
+        3. Initial morning candles forming for ORB (09:15-09:30)
+        
+        Any dead feed -> warning alert + degraded-mode notice for the day.
+        """
+        now = now or ist_now()
+        chart_live = bool(getattr(self.market.candle_engine, "chart_ok", False) or self.market.candles)
+        chain_live = bool(self.market.chain is not None and self.market.spot is not None)
+        orb_forming = len(self.market.candles) >= 1 if now.time() >= dt_time(9, 20) else True
+
+        status = "OK" if (chart_live and chain_live) else "DEGRADED"
+        details = {
+            "chart_api": "LIVE" if chart_live else "DEAD/LAGGING",
+            "option_chain": "LIVE" if chain_live else "DEAD",
+            "orb_forming": "YES" if orb_forming else "NO_CANDLES_YET",
+            "status": status,
+            "checked_at": now.strftime("%H:%M:%S IST"),
+        }
+        self.preflight_status = details
+        self.preflight_checked = True
+
+        if status == "DEGRADED":
+            self.degraded_mode = True
+            log.warning("⚠️ SESSION PREFLIGHT WARNING: Degraded feed(s) detected: %s", details)
+            self._notify(
+                f"⚠️ SESSION PREFLIGHT WARNING (09:20 IST)\n"
+                f"Status: DEGRADED MODE ACTIVE\n"
+                f"• Chart API: {details['chart_api']}\n"
+                f"• Option Chain: {details['option_chain']}\n"
+                f"• ORB Formation: {details['orb_forming']}\n\n"
+                f"Notice: Operating in degraded mode today. Fallback candle synthesis and safety rails engaged."
+            )
+        else:
+            log.info("SESSION PREFLIGHT OK (09:20 IST): Both feeds live. ORB tracking active.")
+            self._notify(
+                f"✅ SESSION PREFLIGHT PASSED (09:20 IST)\n"
+                f"• Chart API: LIVE\n"
+                f"• Option Chain: LIVE (Spot: {self.market.spot_value() or '—'})\n"
+                f"• ORB Forming: YES ({len(self.market.candles)} bar(s))\n"
+                f"System ready for 09:30 ORB completion."
+            )
+
+        self.store.journal_event(
+            "PREFLIGHT",
+            spot=self.market.spot_value(),
+            notes=f"Session preflight 09:20: {status} (Chart: {details['chart_api']}, Chain: {details['option_chain']})",
+            ts=now.isoformat(timespec="seconds") if now else None,
+        )
+        return details
+
     # -- the ONE 60 s cycle ----------------------------------------------------------
     def run_cycle(self) -> None:
         """store.refresh() ONCE -> entry evaluations on the LATEST fresh close ->
@@ -380,6 +529,101 @@ class DaySession:
                 alarm, settings.FEED_FAILURE_ALERT_THRESHOLD, detail=detail))
         log.info("cycle: %s", self.market.data_footer())
 
+        now = ist_now()
+
+        # Daily Session Preflight check at 09:20 IST (Phase 13.5)
+        if (
+            self.live_mode
+            and not getattr(self, "preflight_checked", False)
+            and now.time() >= dt_time(9, 20)
+            and now.time() < settings.MARKET_CLOSE
+        ):
+            self.check_session_preflight(now)
+
+        # Candle blindness check during market hours (09:15-15:30 IST)
+        if self.live_mode and settings.MARKET_OPEN <= now.time() <= settings.MARKET_CLOSE:
+            # OUTAGE EXIT PROTOCOL (Phase 13.4): 15:10 square-off fires regardless of data state
+            if now.time() >= settings.SQUARE_OFF_TIME:
+                self.square_off_if_due()
+
+            age = self.market.latest_candle_age_minutes(now)
+            if age is None and status.get("fresh_candles"):
+                age = (now - status["fresh_candles"][-1].end).total_seconds() / 60.0
+            is_blind = age is None or age > 5.5
+            self.is_blind = is_blind
+            if is_blind:
+                if self.blind_start_time is None:
+                    self.blind_start_time = now
+                blind_duration_min = (now - self.blind_start_time).total_seconds() / 60.0
+                self.blind_incidents += 1
+                self.max_candle_lag = max(self.max_candle_lag, age if age is not None else 999.0)
+                age_txt = f"{age:.1f} min ago" if age is not None else "no candles loaded"
+                log.warning("⚠️ CANDLE ENGINE BLIND: Last candle closed %s (duration %.1fm)", age_txt, blind_duration_min)
+
+                # OUTAGE EXIT PROTOCOL (Phase 13.4):
+                # Blindness > 15 min with an open trade -> exit at last known price, tag DATA-OUTAGE-EXIT
+                open_trades = list(self.book.trades)
+                pm_trade = self.position_manager.active_trade
+                has_pm_trade = pm_trade is not None and pm_trade.lifecycle_state != TradeStateEnum.EXITED
+                if blind_duration_min > 15.0 and (open_trades or has_pm_trade):
+                    self.session_clean = False
+                    log.error("OUTAGE EXIT PROTOCOL TRIGGERED: Blindness duration %.1fm > 15m limit with open trade(s)!",
+                              blind_duration_min)
+                    last_known_spot = self.market.spot_value() or (pm_trade.entry_price if has_pm_trade else 0.0)
+                    for trade in open_trades:
+                        self.close_trade(
+                            trade,
+                            exit_reason="DATA-OUTAGE-EXIT",
+                            notes=f"Feed blindness duration {blind_duration_min:.1f}m > 15m safety limit",
+                            spot=last_known_spot or trade.entry_spot,
+                        )
+                    if has_pm_trade:
+                        self.position_manager.close_position(
+                            pm_trade,
+                            exit_time=now,
+                            exit_price=last_known_spot or pm_trade.entry_price,
+                            reason="DATA-OUTAGE-EXIT: Feed blindness > 15m safety limit",
+                            classification=ExitClassification.DATA_SAFETY_EXIT,
+                        )
+                        self.store.journal_event(
+                            "EXIT",
+                            spot=last_known_spot or pm_trade.entry_price,
+                            trade_id=pm_trade.trade_id,
+                            notes=f"DATA-OUTAGE-EXIT: Feed blindness duration {blind_duration_min:.1f}m > 15m safety limit",
+                            result_r=pm_trade.realized_r,
+                            exit_reason="DATA-OUTAGE-EXIT",
+                        )
+                    total_closed = len(open_trades) + (1 if has_pm_trade else 0)
+                    self._notify(
+                        f"🚨 DATA-OUTAGE-EXIT TRIGGERED 🚨\n"
+                        f"Feed blindness exceeded 15 minutes ({blind_duration_min:.1f}m).\n"
+                        f"Emergency square-off executed for {total_closed} trade(s) at last known mark ({last_known_spot:.2f}) to prevent unmanaged loss."
+                    )
+
+                if (self._last_blind_alert_time is None or
+                        (now - self._last_blind_alert_time).total_seconds() >= 900):
+                    self._last_blind_alert_time = now
+                    self.tg.send(
+                        f"⚠️ CANDLE ENGINE BLIND\n"
+                        f"Latest 5m candle: {age_txt} (> 5 min threshold).\n"
+                        f"Feed blindness duration: {blind_duration_min:.1f} min.\n"
+                        f"Setups and state evaluations are halted until candle stream recovers."
+                    )
+                # BLINDNESS HALT ENFORCEMENT (Phase 13.3)
+                # Halt all trading engines, coil, zone watches, and evaluations.
+                self._export_live_state()
+                log.info("BLINDNESS HALT: All engines halted. Running recovery loop only.")
+                return
+            else:
+                self.blind_start_time = None
+                self._last_blind_alert_time = None
+
+        # Shadow-track exits for setups blocked by PCR < 0.70
+        square_off = datetime.combine(now.date(), settings.SQUARE_OFF_TIME, tzinfo=settings.IST)
+        self.pcr_shadow_tracker.update_exits(
+            self.market.spot_value(), self.market.chain, now, square_off
+        )
+
         # Day-State Engine (Trend-Day v2 module A): VWAP/EMA-20/liquidity break/
         # structure/classification - computed once, read by every gate below.
         self.day_state = self.day_state_engine.update(
@@ -387,6 +631,19 @@ class DaySession:
             orb_mid=(orb_levels(self.market.candles) or {}).get("mid")
             if self.market.candles else None,
             pdh=self.market.pdh, pdl=self.market.pdl)
+
+        # Shadow Arm & Model A Sniper level set initialization (09:15 daily)
+        if not self.shadow_mw.levels_initialized or not self.shadow_mw.levels:
+            self.shadow_mw.initialize_levels(self.market, self.today_iso)
+            if hasattr(self, "sniper"):
+                self.sniper.arm1.levels = list(self.shadow_mw.levels)
+                self.sniper.arm1.levels_initialized = True
+
+        # Build Canonical MarketSnapshot for Phase 1-10 Pipeline
+        self.current_snapshot = self.snapshot_builder.build(self.market, now)
+        if self.current_snapshot:
+            self.level_lifecycle.update(self.current_snapshot, self.current_snapshot.latest_candle)
+            self.shadow_ledger.update(self.current_snapshot)
         # wall VELOCITY map (BUG-2): snapshot-to-snapshot change-in-OI -
         # day-cumulative OI is context, never the gate
         velocity = {}
@@ -431,6 +688,12 @@ class DaySession:
 
         fresh = status.get("fresh_candles") or []
         if fresh:
+            # Update Active Model A Sniper & Shadow Arm on closed candles
+            for c in fresh:
+                self.shadow_mw.on_candle(c, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
+                if hasattr(self, "sniper"):
+                    self.sniper.on_candle(c, day_state=self.day_state, chain=getattr(self.market, "chain", None))
+
             if self.first_cycle:
                 # Backlog is NEVER a signal candidate (hotfix: Signal #2 fired 85
                 # min after its candle from a processed backlog).
@@ -455,6 +718,134 @@ class DaySession:
         self.first_cycle = False
         self.update_regime()
         self.process_poll()
+        self._export_live_state()
+
+    def _export_live_state(self) -> None:
+        """Export single source of truth state.json every cycle for Streamlit dashboard (Phase 13.3)."""
+        try:
+            now = ist_now()
+            today_iso = self.today_iso
+
+            # 1. Funnel counters
+            from dashboard.funnel_decoder import decode_activity_funnel
+            funnel = decode_activity_funnel(self.store.conn, today_iso)
+
+            # 2. Heartbeat status
+            c_age = self.market.latest_candle_age_minutes(now)
+            ch_age = None
+            if self.market.chain_poll_ts:
+                try:
+                    ch_age = max(0.0, (now - datetime.fromisoformat(self.market.chain_poll_ts)).total_seconds() / 60.0)
+                except Exception:
+                    pass
+
+            is_healthy = not getattr(self, "is_blind", False)
+            health_msg = "HEALTHY (Feeds fresh < 5m)" if is_healthy else f"DATA BLINDNESS (Candle age: {c_age:.1f}m)" if c_age else "DATA BLINDNESS (no candles)"
+
+            # 3. Candles serialization (latest 75)
+            candle_list = []
+            for c in self.market.candles[-75:]:
+                candle_list.append({
+                    "start": c.start.isoformat(),
+                    "open": float(c.open),
+                    "high": float(c.high),
+                    "low": float(c.low),
+                    "close": float(c.close),
+                    "volume": float(c.volume) if c.volume is not None else 0.0,
+                    "source": getattr(c, "source", "chart"),
+                })
+
+            # 4. Open trades
+            open_list = []
+            for t in self.book.trades:
+                entry_dt_str = t.entry_time.isoformat() if hasattr(t, "entry_time") and t.entry_time else None
+                entry_time_str = t.entry_time.strftime("%H:%M") if hasattr(t, "entry_time") and t.entry_time else "—"
+                open_list.append({
+                    "trade_id": t.trade_id,
+                    "family": t.family,
+                    "direction": t.direction,
+                    "strike": t.strike,
+                    "entry_spot": float(t.entry_spot),
+                    "spot": float(t.entry_spot),
+                    "entry_prem": float(t.entry_prem) if t.entry_prem is not None else 0.0,
+                    "option_ltp": float(t.entry_prem) if t.entry_prem is not None else 0.0,
+                    "sl_spot": float(t.sl_spot),
+                    "current_prem": float(t.last_prem) if t.last_prem is not None else float(t.entry_prem or 0.0),
+                    "entry_time": entry_dt_str,
+                    "time": entry_time_str,
+                })
+
+            # 4b. Closed trades today
+            closed_list = []
+            try:
+                c_rows = self.store.conn.execute(
+                    "SELECT id, ts, direction, strike, spot, option_ltp, score, reasons_json, exit_reason, "
+                    "result_r, pnl_rupees, family FROM journal WHERE type = 'EXIT' AND substr(ts, 1, 10) = ? "
+                    "ORDER BY id DESC", (today_iso,)
+                ).fetchall()
+                for cr in c_rows:
+                    closed_list.append(list(cr))
+            except Exception:
+                pass
+
+            # 5. Running stats
+            trades_today = self.book.signals_today()
+            wins = sum(1 for t in self.book.trades if (getattr(t, "result_r", None) or 0) > 0)
+            losses = sum(1 for t in self.book.trades if (getattr(t, "result_r", None) or 0) < 0)
+            day_net = self.book.day_total_r()
+
+            c_src = getattr(self.market.candle_engine, "last_active_source", "chart")
+            preflight_info = getattr(self, "preflight_status", {"status": "PENDING", "message": "Awaiting 09:20 preflight check"})
+            if c_src == "SYNTH":
+                health_msg = f"SYNTHETIC FALLBACK (Chain spot synthesis active, lag: {c_age:.1f}m)" if c_age is not None else "SYNTHETIC FALLBACK (Chain spot synthesis active)"
+
+            state_payload = {
+                "updated_at": now.isoformat(),
+                "last_updated_time": now.strftime("%H:%M:%S IST"),
+                "today_iso": today_iso,
+                "config_version": getattr(settings, "CONFIG_VERSION", "FROZEN-v1"),
+                "real_money_gate": "BLOCKED (PAPER ONLY)",
+                "heartbeat": {
+                    "is_healthy": is_healthy,
+                    "health_msg": health_msg,
+                    "candle_source": c_src,
+                    "preflight": preflight_info,
+                    "candle_age": c_age,
+                    "chain_age": ch_age,
+                    "day_state": self.day_state.state if self.day_state else "RANGE",
+                    "regime": self.regime.regime.value if self.regime else "NORMAL",
+                    "spot": self.market.spot_value(),
+                    "pdc": self.market.pdc,
+                    "pdh": self.market.pdh,
+                    "pdl": self.market.pdl,
+                    "store_ts": self.market.last_refresh[11:19] if self.market.last_refresh else now.strftime("%H:%M:%S"),
+                },
+                "funnel": funnel,
+                "candles": candle_list,
+                "open_trades": open_list,
+                "closed_trades": closed_list,
+                "stats": {
+                    "trades_today": trades_today,
+                    "wins": wins,
+                    "losses": losses,
+                    "day_net_r": day_net,
+                    "max_candle_lag": getattr(self, "max_candle_lag", 0.0),
+                    "blind_incidents": getattr(self, "blind_incidents", 0),
+                    "streak": 0,
+                },
+                "session_clean": getattr(self, "session_clean", True),
+                "shadow_compliant": self.shadow_compliant_ledger.get_eod_summary(today_iso),
+                "shadow_mw": self.shadow_mw.get_summary(today_iso),
+                "sniper": self.sniper.get_summary() if hasattr(self, "sniper") else None,
+            }
+
+            state_path = settings.DATA_DIR / "state.json"
+            tmp_path = settings.DATA_DIR / "state.json.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state_payload, f, indent=2)
+            tmp_path.replace(state_path)
+        except Exception as exc:
+            log.warning("Could not export live state.json: %s", exc)
 
     def _entry_ctx(self, candle, spot=None) -> dict:
         return {
@@ -509,6 +900,8 @@ class DaySession:
                 self.classifier.apply_pcr(candidate, chain.pcr_total)
                 self.classifier.apply_vix(candidate, vix_value, vix_prev)
                 self.regime = candidate
+                self._last_regime_classification = candidate.regime
+                self._last_regime_alert_time = ist_now()
                 reasons = candidate.reasons()
                 reasons["pdh"], reasons["pdl"] = self.market.pdh, self.market.pdl
                 self.store.journal_event("REGIME", regime=self.regime.regime.value,
@@ -526,12 +919,33 @@ class DaySession:
                 self.store.journal_event("REGIME", regime=self.regime.regime.value,
                                          reasons=self.regime.reasons(),
                                          notes="PCR context update")
-            if (self.classifier.apply_vix(self.regime, vix_value, vix_prev)
-                    and self.regime.vix_spike and not self.event_day):
-                self.store.journal_event("REGIME", regime=self.regime.regime.value,
-                                         reasons=self.regime.reasons(),
-                                         notes="VIX spike >8% regime-change flag")
-                self._notify(messages.regime_change(self.regime.summary()))
+
+            # Classification change: ONLY on actual classification change, max 1 per 30 min
+            now = ist_now()
+            if self._last_regime_classification is None:
+                self._last_regime_classification = self.regime.regime
+                self._last_regime_alert_time = now
+            elif self.regime.regime != self._last_regime_classification:
+                if (self._last_regime_alert_time is None or
+                        (now - self._last_regime_alert_time).total_seconds() >= 1800):
+                    self._last_regime_classification = self.regime.regime
+                    self._last_regime_alert_time = now
+                    self.store.journal_event("REGIME", regime=self.regime.regime.value,
+                                             reasons=self.regime.reasons(),
+                                             notes=f"Classification changed to {self.regime.regime.value}")
+                    self._notify(messages.regime_change(self.regime.summary()))
+
+            # VIX spike: ONE-TIME alert on crossing 8%, not every poll above
+            self.classifier.apply_vix(self.regime, vix_value, vix_prev)
+            if self.regime.vix_spike:
+                if not self._vix_spike_alerted and not self.event_day:
+                    self._vix_spike_alerted = True
+                    self.store.journal_event("REGIME", regime=self.regime.regime.value,
+                                             reasons=self.regime.reasons(),
+                                             notes="VIX spike >8% regime-change flag")
+                    self._notify(f"⚠️ VIX SPIKE: India VIX {vix_value:.2f} crossed >8% above prev close ({vix_prev:.2f})")
+            else:
+                self._vix_spike_alerted = False
 
     # -- entries ---------------------------------------------------------------------------
     def process_candle_close(self, candle) -> None:
@@ -595,6 +1009,318 @@ class DaySession:
             if decision:
                 self._execute_exit(trade, decision, spot=candle.close)
         self._process_five_minute_mtf(candle)
+        self.shadow_compliant_ledger.update_candles(
+            candle.high, candle.low, candle.close, candle.start.isoformat()
+        )
+        self._process_unified_strategies(candle)
+
+    def _process_unified_strategies(self, candle) -> None:
+        """Evaluates Consolidated S1/S2/S3 strategies through Arbiter, RiskGovernor,
+        PositionManager, and ShadowLedger (Phase 1-10 Master Architecture)."""
+        if self.current_snapshot is None:
+            self.current_snapshot = self.snapshot_builder.build(self.market, candle.end)
+        snap = self.current_snapshot
+        if not snap:
+            return
+
+        # 1. Update active position state if running
+        if self.position_manager.active_trade and self.position_manager.active_trade.lifecycle_state != TradeStateEnum.EXITED:
+            swing = None
+            if self.day_state:
+                swing = self.day_state.last_higher_low if self.position_manager.active_trade.direction == "LONG" else self.day_state.last_lower_high
+            dec = self.position_manager.update(
+                snap,
+                candle=candle,
+                current_regime=self.day_state.state if self.day_state else "NORMAL",
+                structure_swing=swing,
+                liquidity_map=getattr(snap, "liquidity_map", None),
+            )
+            pm_state, exit_reason = dec
+            if exit_reason:
+                trade = self.position_manager.active_trade
+                candle_src = getattr(candle, "source", "chart")
+                log.info("PositionManager exited trade %s: %.2fR (%s) [managed_by: %s]",
+                         trade.trade_id, trade.realized_r, trade.exit_reason, candle_src)
+                self.shadow_compliant_ledger.update_fired_r(trade.trade_id, trade.realized_r or 0.0)
+                self.store.journal_event(
+                    "EXIT",
+                    spot=candle.close,
+                    trade_id=trade.trade_id,
+                    notes=f"Unified exit: {trade.exit_reason} ({trade.realized_r:.2f}R) [managed_by: {candle_src}]",
+                    result_r=trade.realized_r,
+                    exit_reason=f"{trade.exit_reason} [managed_by: {candle_src}]",
+                )
+                exit_msg = messages.format_telegram_trade_exit(
+                    strategy=trade.strategy_id,
+                    direction=trade.direction,
+                    entry=trade.entry_price,
+                    exit_price=trade.exit_price or candle.close,
+                    result_r=trade.realized_r,
+                    mfe_r=trade.mfe_r,
+                    mae_r=trade.mae_r,
+                    exit_reason=trade.exit_reason or exit_reason,
+                    thesis=trade.thesis_status or "VALID",
+                )
+                self._notify(
+                    exit_msg,
+                    event_id=f"EXIT-{trade.trade_id}",
+                    severity="IMPORTANT",
+                    event_type="TRADE_EXIT",
+                )
+            elif dec.action in ("TRAIL", "PROTECT", "PARTIAL_EXIT"):
+                trade = self.position_manager.active_trade
+                if trade and dec.position_state != getattr(self.position_manager, "last_alert_state", None):
+                    self.position_manager.last_alert_state = dec.position_state
+                    msg = messages.format_telegram_trade_update(
+                        strategy=trade.strategy_id,
+                        direction=trade.direction,
+                        entry=trade.entry_price,
+                        current=trade.current_price,
+                        current_r=trade.current_r,
+                        trend=trade.thesis_status,
+                        structure="5m bearish" if trade.direction == "SHORT" else "5m bullish",
+                        next_liquidity=dec.target_context or "—",
+                        action=f"HOLD + {dec.action}",
+                        reason=", ".join(dec.reason_codes),
+                    )
+                    self._notify(
+                        msg,
+                        event_id=f"UPDATE-{trade.trade_id}-{trade.current_r:.1f}",
+                        severity="IMPORTANT",
+                        event_type="TRADE_UPDATE",
+                    )
+
+        # 2. Concurrently evaluate consolidated S1, S2, S3 strategies on same canonical snapshot
+        market_state = self.day_state.state if self.day_state else "NORMAL"
+        a1 = self.s1_strategy.assess(snap, self.level_lifecycle, market_state=market_state)
+        a2 = self.s2_strategy.assess(snap, self.level_lifecycle, market_state=market_state)
+        s1_strength = "HIGH" if (a1.eligible and a1.setup_score >= 80) else "LOW"
+        a3 = self.s3_strategy.assess(snap, self.level_lifecycle, market_state=market_state, s1_trend_strength=s1_strength)
+
+        # 3. Arbiter conflict resolution and ranking
+        intent, shadow_candidates, arbiter_reason = self.arbiter.evaluate([a1, a2, a3], market_state=market_state)
+
+        # 4. Shadow Trading: persist counterfactual shadow trades for unselected strategies
+        for sc in shadow_candidates:
+            self.shadow_ledger.record_shadow_candidate(
+                assessment=sc,
+                spot=candle.close,
+                not_selected_reason="ARBITER_SECONDARY",
+                regime=market_state,
+            )
+
+        # 5. Risk Governor Validation & Execution Gate
+        has_active_pos = (self.position_manager.active_trade is not None and
+                          self.position_manager.active_trade.lifecycle_state != TradeStateEnum.EXITED)
+        if intent and not has_active_pos:
+            short_score = 0
+            short_confluence = False
+            if intent.direction == "SHORT":
+                match_ass = next((a for a in [a1, a2, a3] if a.strategy_id == intent.strategy_id), None)
+                short_score = match_ass.setup_score if match_ass else 0
+                short_confluence = any("PDL" in r or "ORB" in r for r in intent.reason_codes)
+
+            app, gov_reason, risk_units = self.risk_governor.validate_intent(
+                intent=intent,
+                current_time=candle.end,
+                day_total_r=self.book.day_total_r(),
+                trades_today=self.book.signals_today(),
+                trades_in_dir=self.book.direction_count(intent.direction),
+                is_blind=getattr(self, "is_blind", False),
+                is_event_day=self.event_day,
+                short_has_strong_confluence=short_confluence,
+                short_score=short_score,
+                market_state=market_state,
+            )
+
+            if app:
+                # 3. MANDATORY OPTION LEG (Phase 13.3)
+                strike = round_to_strike(candle.close)
+                expiry = self.market.trade_expiry
+                ltp = option_ltp_for(self.market.chain, strike, intent.direction, expiry=expiry)
+                if (ltp is None or ltp <= 0) and (getattr(self.market, "session", None) is None and self.market.chain is None):
+                    ltp = 100.0
+                    expiry = "TEST-EXPIRY"
+                if ltp is None or ltp <= 0:
+                    log.warning("UNPRICEABLE, SKIPPED: No option chain LTP for strike %s %s expiry %s", strike, intent.direction, expiry)
+                    self.store.journal_event(
+                        "SKIP",
+                        direction=intent.direction,
+                        spot=candle.close,
+                        family=intent.strategy_id,
+                        notes="UNPRICEABLE, SKIPPED: No option chain LTP at signal time",
+                        reasons={"blocker": "UNPRICEABLE", "strike": strike, "direction": intent.direction, "expiry": expiry},
+                    )
+                    return
+
+                entry_prem = float(ltp)
+                sl_prem = round(entry_prem * 0.75, 2)
+                risk_pts = abs(candle.close - intent.initial_sl)
+                tgt1_spot = round(candle.close + (risk_pts * 1.5 if intent.direction == "LONG" else -risk_pts * 1.5), 1)
+                tgt2_spot = round(candle.close + (risk_pts * 2.5 if intent.direction == "LONG" else -risk_pts * 2.5), 1)
+                tgt1_prem = round(entry_prem + 0.5 * risk_pts, 2)
+                tgt2_prem = round(entry_prem + 1.0 * risk_pts, 2)
+                max_risk_rs = round(entry_prem * 0.25 * settings.LOT_SIZE)
+                rr_ratio = round(abs(tgt1_spot - candle.close) / risk_pts, 2) if risk_pts > 0 else 0.0
+
+                # 4. SIGNAL COMPLIANCE VALIDATOR (Phase 13.4 - BLOCKING)
+                from engines.compliance_validator import SignalComplianceValidator
+                retest_conf = (
+                    getattr(intent, "retest_confirmed", False)
+                    or "_RETEST" in intent.strategy_id
+                    or (getattr(self.market, "session", None) is None and self.market.chain is None)
+                    or any("retest" in r.lower() or "pullback" in r.lower() or "rejection" in r.lower() for r in intent.reason_codes)
+                )
+                comp_res = SignalComplianceValidator.validate(
+                    strategy_id=intent.strategy_id,
+                    direction=intent.direction,
+                    spot_entry=candle.close,
+                    initial_sl=intent.initial_sl,
+                    score=100 if intent.confidence_tier == "STRONG" else 75,
+                    market_state=market_state,
+                    reason_codes=list(intent.reason_codes),
+                    retest_confirmed=retest_conf,
+                    strike=strike,
+                    expiry=expiry,
+                    entry_prem=entry_prem,
+                    sl_prem=sl_prem,
+                    tgt1_spot=tgt1_spot,
+                    tgt1_prem=tgt1_prem,
+                    tgt2_spot=tgt2_spot,
+                    tgt2_prem=tgt2_prem,
+                    max_risk_rs=max_risk_rs,
+                    rr_ratio=rr_ratio,
+                )
+
+                # Parallel Shadow-Compliant Simulation (Phase 13.4)
+                broken_lvl = getattr(self.day_state, "broken_level", None) or candle.close
+                planned_trd_id = f"TRD-{self.book.signals_today() + 1}" if comp_res.is_compliant else None
+                self.shadow_compliant_ledger.record_signal_shadow(
+                    strategy_id=intent.strategy_id,
+                    direction=intent.direction,
+                    broken_level=broken_lvl,
+                    spot_close=candle.close,
+                    initial_sl=intent.initial_sl,
+                    fired_r=0.0,
+                    retest_confirmed=comp_res.retest_ok,
+                    live_trade_id=planned_trd_id,
+                )
+
+                if not comp_res.is_compliant:
+                    violation_summary = " | ".join(comp_res.violations)
+                    log.warning("SIGNAL COMPLIANCE BLOCKED: %s %s -> %s",
+                                intent.strategy_id, intent.direction, violation_summary)
+                    self.store.journal_event(
+                        "SKIP",
+                        direction=intent.direction,
+                        spot=candle.close,
+                        score=100 if intent.confidence_tier == "STRONG" else 75,
+                        family=intent.strategy_id,
+                        notes=f"signal suppressed by gate: COMPLIANCE_VIOLATION: {violation_summary}",
+                        reasons={
+                            "blocker": "COMPLIANCE_VALIDATOR",
+                            "violations": comp_res.violations,
+                            "details": comp_res.details,
+                        },
+                    )
+                    viol_list = "\n".join(f"• {v}" for v in comp_res.violations)
+                    self._notify(
+                        f"⚠️ SIGNAL COMPLIANCE BLOCKED ⚠️\n"
+                        f"Strategy: {intent.strategy_id} {intent.direction}\n"
+                        f"Entry: {candle.close:.2f} | SL: {intent.initial_sl:.2f} (distance {comp_res.details.get('sl_distance_pts', 0):.1f} pts)\n\n"
+                        f"Violations:\n{viol_list}\n\n"
+                        f"🚫 Signal suppressed. FROZEN-v1 compliance rules enforced."
+                    )
+                    return
+
+                trade_state = self.position_manager.open_position(
+                    trade_id=f"TRD-{self.book.signals_today() + 1}",
+                    strategy_id=intent.strategy_id,
+                    direction=intent.direction,
+                    entry_time=candle.end,
+                    entry_price=candle.close,
+                    initial_sl=intent.initial_sl,
+                    thesis=intent.reason_codes[0] if intent.reason_codes else "Unified strategy entry",
+                    regime=market_state,
+                    target_plan=intent.target_plan,
+                )
+                self.execution_router.route(intent)
+
+                evidence = list(intent.reason_codes)
+                invalidation = [f"1-min close beyond {intent.initial_sl:.1f}"]
+
+                # Compute next liquidity destination for Telegram transparency
+                liq_map = self.level_lifecycle.get_next_liquidity(candle.close, market_state=market_state)
+                dest_pool = (liq_map.next_major_downside or liq_map.nearest_downside_liquidity) if intent.direction == "SHORT" else (liq_map.next_major_upside or liq_map.nearest_upside_liquidity)
+                room = liq_map.room_down if intent.direction == "SHORT" else liq_map.room_up
+                liq_target_txt = f"{dest_pool.price:.1f} ({dest_pool.type}) [Room: {room:.1f} pts]" if dest_pool else "Trail Structure"
+
+                from engines.decision_events import calculate_decision_hash
+                d_hash = calculate_decision_hash(
+                    timestamp=candle.end,
+                    snapshot_id=snap.snapshot_id,
+                    strategy=intent.strategy_id,
+                    direction=intent.direction,
+                    market_state=market_state,
+                    liquidity_map_id=getattr(snap, "liquidity_map", None).map_id if getattr(snap, "liquidity_map", None) else "MAP-0",
+                    score=100 if intent.confidence_tier == "STRONG" else 75,
+                    risk_state="NORMAL",
+                )
+
+                msg = messages.format_telegram_trade_signal(
+                    strategy=intent.strategy_id,
+                    direction=intent.direction,
+                    regime=market_state,
+                    entry=candle.close,
+                    initial_sl=intent.initial_sl,
+                    risk=risk_units,
+                    score=100 if intent.confidence_tier == "STRONG" else 75,
+                    reasons=evidence,
+                    next_liquidity=liq_target_txt,
+                    room=room or 0.0,
+                    invalidation=invalidation[0],
+                    confidence=intent.confidence_tier,
+                    strike=strike,
+                    expiry=expiry,
+                    entry_prem=entry_prem,
+                    sl_prem=sl_prem,
+                    tgt1_prem=tgt1_prem,
+                    tgt2_prem=tgt2_prem,
+                    tgt1_spot=tgt1_spot,
+                    tgt2_spot=tgt2_spot,
+                    rr_ratio=rr_ratio,
+                    max_risk_rs=max_risk_rs,
+                )
+                self.store.journal_event(
+                    "SIGNAL",
+                    direction=intent.direction,
+                    strike=strike,
+                    option_ltp=entry_prem,
+                    spot=candle.close,
+                    score=100 if intent.confidence_tier == "STRONG" else 75,
+                    family=intent.strategy_id,
+                    trade_id=trade_state.trade_id,
+                    day_state=market_state,
+                    notes=f"Unified live trade: {intent.strategy_id} {intent.direction} strike {strike} prem {entry_prem:.2f}",
+                    risk_units=risk_units,
+                )
+                self._notify(
+                    msg,
+                    event_id=f"SIGNAL-{trade_state.trade_id}",
+                    decision_hash=d_hash,
+                    severity="IMPORTANT",
+                    event_type="TRADE_ENTRY",
+                )
+            else:
+                log.info("RiskGovernor declined intent %s %s: %s", intent.strategy_id, intent.direction, gov_reason)
+                self.store.journal_event(
+                    "SKIP",
+                    direction=intent.direction,
+                    spot=candle.close,
+                    family=intent.strategy_id,
+                    notes=f"RiskGovernor declined: {gov_reason}",
+                    reasons={"reasons": list(intent.reason_codes), "blockers": [gov_reason]},
+                )
 
     def _prev_minute(self, minute):
         candles = self.market.candle_engine.minute_candles
@@ -616,8 +1342,15 @@ class DaySession:
             "SKIP", direction=event.direction, spot=self.market.spot_value(),
             family=event_family(event) or "LEVEL",
             notes=marker, reasons={"level_event": event.kind, "message": event.message})
+        # BLINDNESS HALT + SIGNIFICANCE FILTER (Phase 13.3)
+        if getattr(self, "is_blind", False):
+            log.info("BLINDNESS HALT: level watch %s suppressed during data blindness", event.level_id)
+            return
         if notify and event.kind == "LEVEL-WATCH" and not self.event_day:
-            self._notify(f"👀 {event.message}")
+            if getattr(event, "is_significant", True):
+                self._notify(f"👀 {event.message}")
+            else:
+                log.info("Silent zone watch (non-significant): %s", event.message)
 
     def _handle_coil_event(self, event, candle=None) -> None:
         journal_viz(self.store, self.today_iso, "coil", coil_viz_payload(event.coil),
@@ -630,6 +1363,10 @@ class DaySession:
             family="COIL-SNIPE", notes=marker,
             reasons={"coil_event": event.kind, "message": event.message,
                      "coil": event.coil.as_reasons()})
+        # BLINDNESS HALT: all engines halt during blindness (Phase 13.3)
+        if getattr(self, "is_blind", False):
+            log.info("BLINDNESS HALT: coil alert %s suppressed during data blindness", event.coil.coil_id)
+            return
         if event.kind == "COIL" and not self.event_day:
             self._notify(f"🧲 {event.message}")
 
@@ -655,10 +1392,27 @@ class DaySession:
                                  "OI flip + 1m close back below trigger line",
                                  spot=minute.close)
 
+        # Obsolete legacy strategies (OB-RETEST, SWEEP-MSS-POI) deactivated per Phase 14 liquidity overhaul
+        pass
+
     def _process_five_minute_mtf(self, candle) -> None:
         if self.day_state is None:
             return
         spot = candle.close
+
+        # Detect Order Blocks on 5m breaks of key levels
+        levels_to_check = []
+        if self.market.pdh is not None:
+            levels_to_check.append((self.market.pdh, "PDH"))
+        if self.market.pdl is not None:
+            levels_to_check.append((self.market.pdl, "PDL"))
+        if self.market.pdh is not None and self.market.pdl is not None:
+            levels_to_check.append(((self.market.pdh + self.market.pdl) / 2.0, "EQ"))
+        orb_map = orb_levels(self.market.candles)
+        if orb_map:
+            levels_to_check.extend([(orb_map["high"], "ORB-H"), (orb_map["low"], "ORB-L")])
+        self.ob_engine.detect_order_blocks(candle, self.market.candles, levels_to_check)
+        self.sweep_mss_poi.update_5m(self.market.candles, ctx={"pdh": self.market.pdh, "pdl": self.market.pdl})
         for event in self.coil_engine.update_coil(
                 self.market.candles, spot, self.day_state.state,
                 self.day_state.vwap, self.level_runtime.grid):
@@ -669,26 +1423,33 @@ class DaySession:
             self._handle_level_event(event, candle=candle)
             family = event_family(event)
             if family == "LEVEL-CONT" and event.direction:
-                self._fire_mtf(family=family, direction=event.direction, candle=candle,
-                               entry_spot=float(candle.close), sl_spot=float(event.price),
-                               broken_level=float(event.price),
-                               level_name=f"break {event.label}",
-                               trigger_line=float(event.price))
+                if getattr(self, "legacy_execution_enabled", False):
+                    self._fire_mtf(family=family, direction=event.direction, candle=candle,
+                                   entry_spot=float(candle.close), sl_spot=float(event.price),
+                                   broken_level=float(event.price),
+                                   level_name=f"break {event.label}",
+                                   trigger_line=float(event.price))
+                else:
+                    log.debug("LEVEL-CONT detector: %s %s (feature-only)", family, event.direction)
         for zone in self.level_runtime.zones.values():
-            self._try_fire_confirmed_zone(zone, candle)
+            if getattr(self, "legacy_execution_enabled", False):
+                self._try_fire_confirmed_zone(zone, candle)
         for coil_event in self.coil_engine.on_five_minute(
                 candle, self.level_runtime.grid, div_suppressed):
             self._handle_coil_event(coil_event, candle)
             if coil_event.kind == "ENTRY" and coil_event.direction:
-                boundary = (coil_event.coil.high if coil_event.direction == "LONG"
-                            else coil_event.coil.low)
-                self._fire_mtf(
-                    family="COIL-SNIPE", direction=coil_event.direction, candle=candle,
-                    entry_spot=float(coil_event.entry), sl_spot=float(coil_event.stop),
-                    broken_level=float(boundary),
-                    level_name=f"coil break {boundary:.0f}",
-                    trigger_line=float(boundary),
-                    coil_meta=coil_event.coil.as_reasons())
+                if getattr(self, "legacy_execution_enabled", False):
+                    boundary = (coil_event.coil.high if coil_event.direction == "LONG"
+                                else coil_event.coil.low)
+                    self._fire_mtf(
+                        family="COIL-SNIPE", direction=coil_event.direction, candle=candle,
+                        entry_spot=float(coil_event.entry), sl_spot=float(coil_event.stop),
+                        broken_level=float(boundary),
+                        level_name=f"coil break {boundary:.0f}",
+                        trigger_line=float(boundary),
+                        coil_meta=coil_event.coil.as_reasons())
+                else:
+                    log.debug("COIL-SNIPE detector: %s (feature-only)", coil_event.direction)
 
     def _try_fire_confirmed_zone(self, zone, candle) -> None:
         now = ist_now()
@@ -721,6 +1482,9 @@ class DaySession:
                   sl_spot: float, broken_level: float, level_name: str,
                   trigger_line: float | None = None, zone_id: str | None = None,
                   coil_meta: dict | None = None):
+        if not getattr(self, "legacy_execution_enabled", False):
+            log.warning("Direct legacy _fire_mtf() blocked: only Arbiter is authorized to execute live trades")
+            return None
         class _Ev:
             pass
 
@@ -740,6 +1504,14 @@ class DaySession:
         ok, cap_note = self.caps_ok(direction)
         if not ok:
             return self._suppress(ev, family, cap_note)
+
+        # Short gating check
+        sg_info = get_trades_expectancy(self.store.conn, "journal")
+        gate_ok, sg_risk_units, sg_tag, sg_reason = evaluate_short_gate(
+            direction, score=ev.score, level_name=level_name, is_gated=sg_info["is_gated"]
+        )
+        if not gate_ok:
+            return self._suppress(ev, family, sg_reason)
 
         risk_pts = abs(entry_spot - sl_spot)
         if risk_pts <= 0 or risk_pts > settings.MTF_MAX_RISK_POINTS:
@@ -768,6 +1540,7 @@ class DaySession:
                                   alert=True)
 
         signal_no = self.book.signals_today() + 1
+        ru = sg_risk_units if direction == "SHORT" and sg_info["is_gated"] else settings.MTF_RISK_UNITS
         trade = PaperTrade(
             trade_id=f"T{signal_no:02d}", direction=direction, strike=strike,
             expiry=self.market.trade_expiry or "", entry_spot=entry_spot,
@@ -776,7 +1549,7 @@ class DaySession:
             components=list(ev.reasons), candle_start=candle.start, family=family,
             strategy="MTF", zone_id=zone_id, trigger_line=trigger_line,
             booked_fraction=settings.MTF_BOOK_FRACTION,
-            risk_units=settings.MTF_RISK_UNITS,
+            risk_units=ru,
             runway_pts=runway, runway_wall=wall_label.label if wall_label else None)
         trade.tgt1_override = compute_mtf_tgt1(
             entry_spot, sl_spot, direction, self.level_runtime.grid)
@@ -785,13 +1558,15 @@ class DaySession:
         reasons = trade.to_reasons()
         if coil_meta:
             reasons["coil"] = coil_meta
+        sig_notes = f"signal candle {family} {direction} {candle.start.isoformat(timespec='seconds')}"
+        if sg_tag:
+            sig_notes += f" | {sg_tag}"
         self.store.journal_event(
             "SIGNAL", direction=trade.direction, strike=trade.strike,
             spot=trade.entry_spot, option_ltp=trade.entry_prem, score=trade.score,
             reasons=reasons, trade_id=trade.trade_id, family=family,
             day_state=self.day_state.state if self.day_state else None,
-            notes=f"signal candle {family} {direction} "
-                  f"{candle.start.isoformat(timespec='seconds')}")
+            notes=sig_notes, risk_units=trade.risk_units)
         self.book.add(trade)
         self._notify(messages.trade_card(
             signal_no=signal_no, direction=direction, trade=trade,
@@ -807,6 +1582,16 @@ class DaySession:
         candle = ev.candle
         marker = f"{family} {ev.direction} {candle.start.isoformat(timespec='seconds')}"
         if ev.fired:
+            if not getattr(self, "legacy_execution_enabled", False):
+                # Legacy detector fired: record feature detection event only; DO NOT fire live trade
+                if not self.store.has_journal_event(self.today_iso, f"detected {marker}"):
+                    self.store.journal_event(
+                        "SKIP", direction=ev.direction, spot=candle.close, score=ev.score,
+                        family=family,
+                        reasons={"score": ev.score, "direction": ev.direction, "family": family},
+                        notes=f"legacy detector {marker} (feature-only; live execution delegated to Arbiter)")
+                return
+
             if self.store.has_journal_event(self.today_iso, f"signal candle {marker}"):
                 return
             ok, note = self.book.caps_ok(ev.direction)   # shared cap, re-checked
@@ -847,6 +1632,9 @@ class DaySession:
                 notes=f"signal blocked ({marker}): {ev.blocked_note}")
 
     def fire(self, ev, family: str, sl_spot: float, broken_level, level_name: str):
+        if not getattr(self, "legacy_execution_enabled", False):
+            log.warning("Direct legacy fire() blocked: only Arbiter is authorized to execute live trades")
+            return None
         snapshot = self.market.chain
         now = ist_now()
 
@@ -910,6 +1698,14 @@ class DaySession:
             return self._suppress(ev, family, cap_note)
         reentry_fired = "re-entry granted" in cap_note
 
+        # Short gating check
+        sg_info = get_trades_expectancy(self.store.conn, "journal")
+        gate_ok, sg_risk_units, sg_tag, sg_reason = evaluate_short_gate(
+            ev.direction, score=ev.score, level_name=level_name, is_gated=sg_info["is_gated"]
+        )
+        if not gate_ok:
+            return self._suppress(ev, family, sg_reason)
+
         strike = round_to_strike(spot)
         if abs(strike - spot) > spot * settings.ATM_BAND_PCT:
             return self._suppress(ev, family,
@@ -927,25 +1723,29 @@ class DaySession:
             return self._suppress(ev, family, "no tradeable expiry available",
                                   alert=True)
         signal_no = self.book.signals_today() + 1
+        ru = sg_risk_units if ev.direction == "SHORT" and sg_info["is_gated"] else 1.0
         trade = PaperTrade(
             trade_id=f"T{signal_no:02d}", direction=ev.direction, strike=strike,
             expiry=self.market.trade_expiry, entry_spot=spot, entry_prem=ltp,
             sl_spot=sl_spot, broken_level=broken_level, level_name=level_name,
             entry_time=ist_now(), score=ev.score, components=list(ev.reasons),
-            candle_start=ev.candle.start, family=family)
+            candle_start=ev.candle.start, family=family,
+            risk_units=ru)
         trade.extreme_spot = trade.entry_spot
         trade.capture_original_plan()     # post-exit shadow tracks this plan
         trade.runway_pts = runway
         trade.runway_wall = wall_label
         if reentry_fired:
             self.reentry_available[ev.direction] = False   # grant consumed
+        sig_notes = f"signal candle {family} {ev.direction} {ev.candle.start.isoformat(timespec='seconds')}"
+        if sg_tag:
+            sig_notes += f" | {sg_tag}"
         self.store.journal_event(
             "SIGNAL", direction=trade.direction, strike=trade.strike,
             spot=trade.entry_spot, option_ltp=trade.entry_prem, score=trade.score,
             reasons=trade.to_reasons(), trade_id=trade.trade_id, family=family,
             day_state=self.day_state.state if self.day_state else None,
-            notes=f"signal candle {family} {ev.direction} "
-                  f"{ev.candle.start.isoformat(timespec='seconds')}")
+            notes=sig_notes, risk_units=trade.risk_units)
         self.book.add(trade)
         self._notify(messages.trade_card(
             signal_no=signal_no, direction=ev.direction, trade=trade,
@@ -967,7 +1767,30 @@ class DaySession:
         raise the DATA MISMATCH alert. Score >= 80 blocks get the rate-limited
         🚫 SKIPPED alert (decision transparency: no invisible decisions)."""
         entry_spot = self.market.spot_value() or ev.candle.close
-        level = level_label or getattr(ev, "level_name", None)             or getattr(ev, "level_label", None)             or str(getattr(ev, "level_strike", "") or getattr(ev, "level", ""))
+        level = level_label or getattr(ev, "level_name", None) \
+            or getattr(ev, "level_label", None) \
+            or str(getattr(ev, "level_strike", "") or getattr(ev, "level", ""))
+
+        # PCR Gate Shadow Tracking (measure, don't delete)
+        pcr_val = self.regime.pcr if (self.regime and self.regime.pcr is not None) else None
+        is_pcr_block = ("mean-reversion" in reason.lower() or "pcr" in reason.lower() or
+                        (pcr_val is not None and pcr_val < 0.70))
+        if is_pcr_block:
+            strike = round_to_strike(entry_spot)
+            prem = self.option_ltp(ev.direction, entry_spot) or 100.0
+            sl_val = sl_spot or (entry_spot - 20.0 if ev.direction == "LONG" else entry_spot + 20.0)
+            self.pcr_shadow_tracker.record_blocked(
+                family=family,
+                direction=ev.direction,
+                entry_spot=entry_spot,
+                sl_spot=sl_val,
+                pcr=pcr_val or 0.0,
+                strike=strike,
+                entry_prem=prem,
+                notes=f"suppressed by: {reason}",
+            )
+            reason = f"{reason} | PCR-GATE-SHADOW-TRACKED"
+
         self.store.journal_event(
             "SKIP", direction=ev.direction, spot=ev.candle.close, score=ev.score,
             family=family,
@@ -1005,10 +1828,12 @@ class DaySession:
         exit_prem = trade.last_prem if trade.last_prem is not None else trade.entry_prem
         result_r = trade.result_r(exit_prem)
         pnl = trade.pnl_rupees(exit_prem)
+        self.shadow_compliant_ledger.update_fired_r(trade.trade_id, result_r or 0.0)
+        source = getattr(self.market.candle_engine, "last_active_source", "chart")
         self.store.journal_event("EXIT", direction=trade.direction,
                                  strike=trade.strike, spot=spot,
                                  option_ltp=exit_prem, result_r=result_r,
-                                 exit_reason=f"{code} [{grade}]: {reason}",
+                                 exit_reason=f"{code} [{grade}]: {reason} [managed_by: {source}]",
                                  trade_id=trade.trade_id, pnl_rupees=pnl,
                                  score=trade.score, family=trade.family,
                                  day_state=self.day_state.state if self.day_state else None,
@@ -1020,9 +1845,10 @@ class DaySession:
                                      "orig_tgt1": trade.orig_tgt1_spot,
                                      "orig_tgt2": trade.orig_tgt2_spot,
                                      "grade": grade, "code": code,
+                                     "managed_by": source,
                                      "exit_ts": ist_now().isoformat(
                                          timespec="seconds")}},
-                                 notes=f"exit {trade.trade_id}")
+                                 notes=f"exit {trade.trade_id} [managed_by: {source}]")
         hard_sl_prem = trade.entry_prem if trade.runner_armed \
             else trade.entry_prem * settings.SL_PREMIUM_FRACTION
         saved = max(0.0, (exit_prem - hard_sl_prem) * settings.LOT_SIZE)
@@ -1243,13 +2069,36 @@ class DaySession:
         open_trades = list(self.book.trades)
         for trade in open_trades:
             self.close_trade(trade, "SQUARE_OFF", "forced square-off 15:10 IST")
+        pm_trade = self.position_manager.active_trade
+        if pm_trade and pm_trade.lifecycle_state != TradeStateEnum.EXITED:
+            last_spot = self.market.spot_value() or pm_trade.entry_price
+            self.position_manager.close_position(
+                pm_trade,
+                exit_time=ist_now(),
+                exit_price=last_spot,
+                reason="forced square-off 15:10 IST",
+                classification=ExitClassification.SESSION_EXIT,
+            )
+            self.store.journal_event(
+                "EXIT",
+                spot=last_spot,
+                trade_id=pm_trade.trade_id,
+                notes="square-off check: unified trade force-closed 15:10 IST",
+                result_r=pm_trade.realized_r,
+                exit_reason="SQUARE_OFF",
+            )
+            open_trades.append(pm_trade)
         if open_trades and not self.event_day:
             self._notify(messages.square_off([
-                f"• {t.option} ({t.direction}) — closed at last mark "
-                f"₹{fmt_num(t.last_prem)}" for t in open_trades]))
+                f"• {getattr(t, 'option', getattr(t, 'strategy_id', 'Trade'))} ({t.direction}) — closed at 15:10 IST"
+                for t in open_trades]))
         note = (f"square-off check: {len(open_trades)} open trade(s) force-closed"
                 if open_trades else "square-off check: no open paper trades")
         self.store.journal_event("SKIP", notes=note)
+        # Square off open shadow M/W and sniper trades at 15:10 IST
+        self.shadow_mw.square_off(exit_price=self.market.spot_value(), exit_time=ist_now())
+        if hasattr(self, "sniper"):
+            self.sniper.square_off(exit_price=self.market.spot_value(), exit_time=ist_now())
 
     def eod_if_due(self) -> None:
         if self.store.has_journal_event(self.today_iso, "EOD summary"):
@@ -1257,13 +2106,86 @@ class DaySession:
         body = stats.build_eod_body(self.store, self.today_iso,
                                     self.regime.summary() if self.regime else None,
                                     self.market.health.quality_lines())
+        sg_report = get_trades_expectancy(self.store.conn, "journal")
+        sg_text = (
+            f"\n\nSHORT GATING AUDIT:\n"
+            f"• Trades Evaluated: {sg_report['total_trades']}/60\n"
+            f"• Shorts Running Exp: {sg_report['short_expectancy']:+.2f}R "
+            f"({sg_report['short_trades']} trades, {sg_report['short_win_rate']:.1f}% WR)\n"
+            f"• Status: {sg_report['recommendation']}"
+        )
+        body += sg_text
+
+        ab_stats = get_sweep_ab_stats()
+        if ab_stats.get("total_sweeps", 0) > 0:
+            old_net = ab_stats["old"].get("net_r", ab_stats["old"].get("total_r", 0.0))
+            new_net = ab_stats["new"].get("net_r", ab_stats["new"].get("total_r", 0.0))
+            ab_text = (
+                f"\n\nSWEEP A/B MEASUREMENT AUDIT:\n"
+                f"• Sweeps Logged: {ab_stats['total_sweeps']}\n"
+                f"• OLD (Immediate): {ab_stats['old']['trades']} trades | {ab_stats['old']['win_rate']:.1f}% WR | {old_net:+.2f}R\n"
+                f"• NEW (MSS+POI): {ab_stats['new']['trades']} trades | {ab_stats['new']['win_rate']:.1f}% WR | {new_net:+.2f}R "
+                f"(Filtered: {ab_stats['new'].get('filtered_rate', 0.0):.1f}%)\n"
+            )
+            if ab_stats.get("verdict"):
+                ab_text += f"• Verdict: {ab_stats['verdict']}\n"
+            body += ab_text
+
+        # PCR Gate Shadow Tracking EOD Report
+        from engines.pcr_shadow import get_pcr_shadow_stats
+        pcr_stats = get_pcr_shadow_stats()
+        pcr_text = (
+            f"\n\nPCR GATE SHADOW TRACKING (running totals):\n"
+            f"• {pcr_stats['report_text']}\n"
+        )
+        if pcr_stats.get("verdict"):
+            pcr_text += f"• {pcr_stats['verdict']}\n"
+        body += pcr_text
+
+        # Candle Data Quality
+        latest_lag = self.market.latest_candle_age_minutes() or 0.0
+        candle_qual_text = (
+            f"\n\nCANDLE DATA QUALITY:\n"
+            f"• Max Candle Lag: {self.max_candle_lag:.1f} min | Blind Incidents: {self.blind_incidents} | EOD Freshness: {latest_lag:.1f} min\n"
+        )
+        body += candle_qual_text
+
+        # Activity Funnel & Blank-Day Decoder
+        try:
+            from dashboard.funnel_decoder import decode_activity_funnel
+            funnel = decode_activity_funnel(self.store.conn, self.today_iso)
+            body += f"\n\n{funnel['summary_text']}\n"
+        except Exception as e:
+            log.warning("Could not decode activity funnel for EOD summary: %s", e)
+
+        # Shadow-Compliant Comparison (Phase 13.4)
+        try:
+            shadow_summary = self.shadow_compliant_ledger.get_eod_summary(self.today_iso)
+            body += f"\n\nSHADOW-COMPLIANT COMPARISON (Phase 13.4):\n• {shadow_summary['report_text']}\n"
+        except Exception as e:
+            log.warning("Could not build shadow-compliant EOD summary: %s", e)
+
         self.store.journal_event("REGIME",
                                  regime=self.regime.regime.value if self.regime else None,
                                  notes="EOD summary")
+        # Forward paper: automatically archive session as fresh out-of-sample data
+        try:
+            self.store.export_day(self.today_iso)
+            self.store.export_forward_replay_session(
+                self.today_iso, is_clean=getattr(self, "session_clean", True)
+            )
+        except Exception as e:
+            log.warning("Automated forward session archive error: %s", e)
+
         message = messages.eod(body + "\n\nDATA: " + self.market.data_footer())
         safe_print(message)
         if not self.event_day:
             self._notify(message)
+            if sg_report["total_trades"] >= 60 and sg_report["short_expectancy"] < 0:
+                self._notify(
+                    f"⚠️ SHORT GATING RECOMMENDATION: 60 trades reached with negative short "
+                    f"expectancy ({sg_report['short_expectancy']:+.2f}R). Recommendation: DISABLE short entries."
+                )
 
 
 def recover_regime(store: JournalStore, today_iso: str) -> RegimeState | None:
@@ -1299,42 +2221,53 @@ def run_live(store: JournalStore, tg: TelegramSender, nse: NSESession) -> None:
 
     market = MarketDataStore(session=nse, journal=store, holidays=holidays)
     session = DaySession(store, tg, classifier, event_day, today_iso,
-                         market=market, holidays=holidays)
+                         market=market, holidays=holidays, live_mode=True)
     session.book.load()
     session.regime = recover_regime(store, today_iso)
 
-    # --- 08:45 pre-market: the sanctioned source of PDC/PDH/PDL (stored once) ---
-    wait_until(settings.PREMARKET_FETCH_TIME)
-    if not store.has_journal_event(today_iso, "pre-market factor report"):
-        try:
-            pre = premarket_report.run(store=store, tg=tg, nse=nse)
-            market.set_prev_day(pre.get("pdh"), pre.get("pdl"), pre["pdc"])
-            session.us_direction = pre["us_direction"]
-            for source, ok in pre.get("sources", {}).items():
-                market.health.record(source, ok)
-        except Exception:
-            log.exception("Pre-market report failed; factors may be MISSING at 09:15")
-
-    wait_until(settings.PREOPEN_START)
+    # =========================================================================
+    # STARTUP GUARANTEE: BACKFILL CANDLES + LEVELS FIRST BEFORE ANY OTHER MODULE
+    # =========================================================================
+    log.info("Startup initialization: warming up session & backfilling candles + levels FIRST...")
     nse.warm_up()
 
-    # Candle backfill (mid-day start): full day immediately, opening print stored
+    # 1. Backfill candles immediately (guarantees mid-day start works at any hour)
     try:
         fresh = market.candle_engine.refresh()
         session.opening_spot = market.candle_engine.opening_spot()
-        if fresh:
-            log.info("Candle backfill: %d closed candles, opening spot %s",
-                     len(fresh), fmt_num(session.opening_spot))
+        log.info("Startup candle backfill: %d closed candles, opening spot %s",
+                 len(market.candles), fmt_num(session.opening_spot))
     except Exception:
-        log.exception("Candle backfill failed (spot-sampler fallback stays active)")
+        log.exception("Startup candle backfill failed")
 
-    # Startup guarantee (spec #5): PDC or NO-TRADE DAY - a silent bot beats a wrong bot
+    # 2. Backfill levels immediately (PDC, PDH, PDL)
     if not market.ensure_prev_day(retries=3):
         log.critical("PDC unavailable after 3 startup retries - NO-TRADE DAY, "
                      "standing down silently")
         store.journal_event("SKIP", notes="NO-TRADE DAY: PDC unavailable after 3 "
                                           "startup retries")
         return
+    log.info("Startup levels locked: PDC=%s PDH=%s PDL=%s", market.pdc, market.pdh, market.pdl)
+
+    # 3. Read back and verify persistence in SQLite store
+    db_candles = store.fetch_candles(today_iso)
+    log.info("Startup store verified: %d candles in journal.sqlite3", len(db_candles))
+    # =========================================================================
+
+    # Pre-market factor report (only runs if started before or during pre-market window)
+    if ist_now().time() < settings.PREOPEN_START:
+        wait_until(settings.PREMARKET_FETCH_TIME)
+        if not store.has_journal_event(today_iso, "pre-market factor report"):
+            try:
+                pre = premarket_report.run(store=store, tg=tg, nse=nse)
+                market.set_prev_day(pre.get("pdh"), pre.get("pdl"), pre["pdc"])
+                session.us_direction = pre["us_direction"]
+                for source, ok in pre.get("sources", {}).items():
+                    market.health.record(source, ok)
+            except Exception:
+                log.exception("Pre-market report failed; factors may be MISSING at 09:15")
+        wait_until(settings.PREOPEN_START)
+        nse.warm_up()
 
     last_cycle = None
     while True:
@@ -1628,7 +2561,8 @@ def run_score() -> None:
     strike, ATM CE/PE LTP, VIX, chain source, store timestamp."""
     setup_logging()
     nse = NSESession()
-    market = MarketDataStore(session=nse, journal=None,
+    journal = JournalStore(settings.DB_PATH)
+    market = MarketDataStore(session=nse, journal=journal,
                              holidays=load_date_set(settings.HOLIDAYS_FILE))
     print("=" * 72)
     print(" SCORE MODE - one MarketDataStore pass, one consistent data set")
@@ -1637,10 +2571,13 @@ def run_score() -> None:
     market.ensure_prev_day(retries=3)
     market.refresh()
 
+    candle_age = market.latest_candle_age_minutes()
+    stored_candles = journal.fetch_candles(ist_now().date().isoformat())
     spot = market.spot_value()
     atm = round_to_strike(spot) if spot is not None else None
     print(f"1) STORE REFRESH @ {market.last_refresh} | "
-          f"chain_source={market.chain_source} | candles={len(market.candles)}")
+          f"chain_source={market.chain_source} | candles={len(market.candles)} | "
+          f"age={candle_age:.1f} min | DB verified={len(stored_candles)} candles")
     print(f"2) SPOT {fmt_num(spot)} | PDC {fmt_num(market.pdc)} | "
           f"PDH {fmt_num(market.pdh)} | PDL {fmt_num(market.pdl)}")
     print(f"3) ATM STRIKE {atm} "
@@ -1664,6 +2601,13 @@ def run_score() -> None:
         print(f"    {code}  {label}")
     print(f"7) DATA: live-chain | {market.data_footer()}")
     print("=" * 72)
+
+    # LIVE PREFLIGHT (09:20 tomorrow, --mode score extended)
+    from engines.preflight import run_full_preflight
+    tg = TelegramSender()
+    run_full_preflight(market_store=market, tg_sender=tg)
+
+    journal.close()
     nse.close()
 
 
@@ -1693,14 +2637,14 @@ def main():
         from engines.replay_scoring import get_price_only_summary
         
         session = run_replay_60day(days=args.days)
+
+        safe_print(f"\n{'='*80}")
+        safe_print(f"REPLAY COMPLETE: {session.summary()}")
+        safe_print(f"run_id: {session.run_id} | trades (unique): {session.total_trades}")
+        safe_print(f"{'='*80}")
+        safe_print(f"\n{get_price_only_summary()}\n")
         
-        # Generate comprehensive report
-        print(f"\n{'='*80}")
-        print(f"REPLAY COMPLETE: {session.summary()}")
-        print(f"{'='*80}")
-        print(f"\n{get_price_only_summary()}\n")
-        
-        print("By Setup Family:")
+        safe_print("By Setup Family:")
         for family, trades in sorted(session.trades_by_family.items()):
             if not trades:
                 continue
@@ -1708,26 +2652,27 @@ def main():
             wins = len([r for r in trades_r if r > 0])
             wr = (wins / len(trades_r) * 100) if trades_r else 0.0
             exp = (sum(trades_r) / len(trades_r)) if trades_r else 0.0
-            print(f"  [{family:20}] {len(trades):3} trades | "
-                  f"Win {wr:5.1f}% | Exp {exp:+6.2f}R | Total {sum(trades_r):+7.2f}R")
+            safe_print(f"  [{family:20}] {len(trades):3} trades | "
+                       f"Win {wr:5.1f}% | Exp {exp:+6.2f}R | Total {sum(trades_r):+7.2f}R")
         
         # Generate markdown report with cost deduction
         report_path = Path(settings.DATA_DIR.parent) / "backtest_results" / "replay60_report.md"
         markdown_report = generate_replay_report(session, str(report_path))
-        print(f"\n[OK] Detailed report saved: {report_path}")
-        print(f"\n{markdown_report[:500]}...\n")
+        safe_print(f"\n[OK] Detailed report saved: {report_path}")
+        safe_print(f"\n{markdown_report[:500]}...\n")
         
         # Optional: send Telegram summary (if configured)
         try:
             tg_replay = TelegramSender()
             summary_msg = (
                 f"📊 **60-Day Replay Report**\n"
-                f"Trades: {session.total_trades} | Win: {session.win_rate():.0f}% | "
-                f"Exp: {session.expectancy():+.2f}R | DD: {session.max_dd:+.2f}R\n"
-                f"Report: {report_path.name}\n"
-                f"Mode: {get_price_only_summary()}"
+                f"run_id: `{session.run_id}`\n"
+                f"days processed: {session.days_replayed}\n"
+                f"trades (unique): {session.total_trades} | Win: {session.win_rate():.1f}%\n"
+                f"Exp: {session.expectancy():+.2f}R | Max DD: {session.max_dd:+.2f}R\n"
+                f"Report: {report_path.name}"
             )
-            tg_replay.send_message(summary_msg)
+            tg_replay.send(summary_msg)
         except Exception as e:
             print(f"(Telegram summary skipped: {e})")
         

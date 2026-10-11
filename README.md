@@ -464,21 +464,20 @@ python replay_compare.py --date 2026-10-06 --interactive
 
 **Output**: Formatted tables with all trades, state timeline (zone lifecycle), and comparison against your manual marks.
 
-### Streamlit Interactive Viewer (`dashboard/replay_viewer.py`)
+### Streamlit Live Trading Dashboard (`dashboard/app.py`)
 
-Visual replay with playback controls:
+Visual real-time dashboard with upside/downside entry triggers and option execution:
 
 ```bash
-pip install streamlit plotly pandas  # One-time
-streamlit run dashboard/replay_viewer.py
+streamlit run dashboard/app.py
+# or run launcher:
+.\run_live_dashboard.bat
 ```
 
 **Features**:
-- Play / Pause / Step / Reset controls
-- Speed adjustment: 1x-10x
-- Live candlestick chart with signal markers (green/red triangles)
-- Click-to-mark entries during replay
-- Day-end comparison: your marks vs engine signals
-- Summary card: trades, win rate, total R, family breakdown
-
-All replay tools read from the same engine, so results are consistent across CLI, CSV, and visual modes.
+- Real-time 5m candlestick chart with session breaks (09:15 open)
+- Dynamic upside (🟢 BUY CE) and downside (🔴 BUY PE) entry symbols and annotations directly on the trigger candle
+- Stop Loss, Target 1 (50% book + Breakeven), and Target 2 lines
+- Golden Pocket [0.50 – 0.618] shaded zone and FRVP (VAH, VAL, POC) levels
+- Live Option Chain position card (exact strike, buying premium band, SL, and targets)
+- Executed options trades ledger with step-by-step breakdown

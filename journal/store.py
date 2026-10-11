@@ -15,6 +15,7 @@ import json
 import logging
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import settings
 from engines.oi_engine import OIDiff
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS journal (
     trade_id TEXT,
     pnl_rupees REAL,
     family TEXT,
-    day_state TEXT
+    day_state TEXT,
+    risk_units REAL
 );
 CREATE TABLE IF NOT EXISTS oi_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +96,7 @@ class JournalStore:
         self._conn.executescript(_SCHEMA)
         # Migration for DBs created before the daily-worker upgrade (Prompt 2):
         for column in ("trade_id TEXT", "pnl_rupees REAL", "family TEXT",
-                       "day_state TEXT"):
+                       "day_state TEXT", "risk_units REAL"):
             try:
                 self._conn.execute(f"ALTER TABLE journal ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -114,16 +116,17 @@ class JournalStore:
     def journal_event(self, event_type, *, direction=None, strike=None, spot=None,
                       option_ltp=None, score=None, reasons=None, exit_reason=None,
                       result_r=None, regime=None, notes=None, trade_id=None,
-                      pnl_rupees=None, family=None, day_state=None):
-        ts = ist_now().isoformat(timespec="seconds")
+                      pnl_rupees=None, family=None, day_state=None, risk_units=None,
+                      ts=None):
+        ts = ts or ist_now().isoformat(timespec="seconds")
         self._conn.execute(
             "INSERT INTO journal (ts, type, direction, strike, spot, option_ltp, score, "
             "reasons_json, exit_reason, result_r, regime, notes, trade_id, pnl_rupees, "
-            "family, day_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "family, day_state, risk_units) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, event_type, direction, strike, spot, option_ltp, score,
              json.dumps(reasons, default=str) if reasons is not None else None,
              exit_reason, result_r, regime, notes, trade_id, pnl_rupees, family,
-             day_state))
+             day_state, risk_units))
         self._conn.commit()
         log.info("journal: %s | %s", event_type, (regime or notes or "")[:120])
 
@@ -251,6 +254,23 @@ class JournalStore:
             paths.append(out_path)
         log.info("CSV export for %s: %s", iso_date, [str(p) for p in paths])
         return paths
+
+    def export_forward_replay_session(self, iso_date: str, is_clean: bool = True) -> Path | None:
+        """Export session candles to data/exports/forward_sessions for automated forward out-of-sample replay."""
+        forward_dir = settings.EXPORTS_DIR / "forward_sessions"
+        forward_dir.mkdir(parents=True, exist_ok=True)
+        candles = self.fetch_candles(iso_date)
+        if not candles:
+            return None
+        prefix = f"{iso_date}" if is_clean else f"{iso_date}_NON_CLEAN"
+        out_path = forward_dir / f"{prefix}_candles_5m.csv"
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "Open", "High", "Low", "Close", "Volume", "source"])
+            for c in candles:
+                writer.writerow([c["start"].isoformat(), c["open"], c["high"], c["low"], c["close"], c["volume"] or 0, c["source"]])
+        log.info("Forward paper out-of-sample session archived: %s (clean=%s)", out_path, is_clean)
+        return out_path
 
     def _fetch_day(self, table, iso_date):
         columns = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]

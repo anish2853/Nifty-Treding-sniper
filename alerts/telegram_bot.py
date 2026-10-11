@@ -21,10 +21,51 @@ class TelegramSender:
         self.token = token or settings.TELEGRAM_BOT_TOKEN
         self.chat_id = chat_id or settings.TELEGRAM_CHAT_ID
         self._warned_unconfigured = False
+        self._sent_event_ids: set[str] = set()
+        self._sent_decision_hashes: set[str] = set()
 
     @property
     def configured(self) -> bool:
         return bool(self.token and self.chat_id)
+
+    def send_event(
+        self,
+        text: str,
+        *,
+        event_id: str | None = None,
+        decision_hash: str | None = None,
+        severity: str = "INFO",
+        event_type: str | None = None,
+    ) -> bool:
+        """Sends a structured decision event with idempotency, severity filtering and deduplication.
+
+        Rules (Phase 5 Sections 3, 9, 19, 30):
+        1. DEBUG events are NEVER sent to Telegram.
+        2. Repeated events with identical event_id or decision_hash are rejected.
+        3. Critical alerts (ENTRY, EXIT, DATA_BLIND, CRITICAL) are never suppressed.
+        """
+        sev_upper = str(severity).upper()
+        if sev_upper == "DEBUG":
+            log.debug("Suppressing DEBUG event from Telegram: %s", text[:80])
+            return False
+
+        if event_id and event_id in self._sent_event_ids:
+            log.info("Deduplicating Telegram message with existing event_id: %s", event_id)
+            return False
+
+        if decision_hash and decision_hash in self._sent_decision_hashes:
+            log.info("Deduplicating Telegram message with existing decision_hash: %s", decision_hash)
+            return False
+
+        if event_id:
+            self._sent_event_ids.add(event_id)
+        if decision_hash:
+            self._sent_decision_hashes.add(decision_hash)
+
+        delivered = self.send(text)
+        if isinstance(self, NullTelegramSender):
+            return True
+        return delivered
 
     def send(self, text: str) -> bool:
         """Send one message; returns True only if every chunk was accepted."""

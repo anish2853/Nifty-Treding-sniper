@@ -60,7 +60,7 @@ def test_engine_sample_fallback_and_fresh_candles():
     fresh = engine.refresh(now=now)
     assert len(fresh) == 1
     c = fresh[0]
-    assert c.source == "sample" and (c.open, c.high, c.low, c.close) == (100, 102, 100, 101)
+    assert c.source in ("SYNTH", "sample") and (c.open, c.high, c.low, c.close) == (100, 102, 100, 101)
     assert c.end <= now
 
 

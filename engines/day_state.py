@@ -46,13 +46,16 @@ class DayState:
     structure_intact: bool = True
     last_higher_low: float | None = None
     last_lower_high: float | None = None
+    eq: float | None = None             # Equilibrium midline = (PDH + PDL) / 2
+    eq_bias: str | None = None          # "long-preferred" | "short-preferred"
     notes: list = field(default_factory=list)
     transitions: list = field(default_factory=list)   # [(ts, "A->B", boundary)]
 
     def as_ctx(self) -> dict:
         return {"state": self.state, "structure_intact": self.structure_intact,
                 "vwap": self.vwap, "broken_level": self.broken_level,
-                "broken_side": self.broken_side}
+                "broken_side": self.broken_side,
+                "eq": self.eq, "eq_bias": self.eq_bias}
 
     def summary(self) -> str:
         vwap = f"{self.vwap:.2f}" if self.vwap is not None else "MISSING"
@@ -60,9 +63,10 @@ class DayState:
         rng = (f"{self.first_hour_low:.2f}-{self.first_hour_high:.2f}"
                if self.first_hour_low is not None else "unlocked")
         bias = self.bias or "-"
+        eq_txt = f" | EQ {self.eq:.2f} ({self.eq_bias})" if self.eq is not None else ""
         return (f"{self.state} | 1h-range {rng} | VWAP {vwap}"
                 f"{' (proxy)' if self.vwap_proxy else ''} | EMA20 {ema} | "
-                f"bias {bias} | structure "
+                f"bias {bias}{eq_txt} | structure "
                 f"{'intact' if self.structure_intact else 'BROKEN'}")
 
 
@@ -74,8 +78,12 @@ class DayStateEngine:
     def __init__(self):
         self.state = DayState()
 
-    def update(self, candles, spot, orb_mid=None, pdh=None, pdl=None) -> DayState:
+    def update(self, candles, spot=None, orb_mid=None, pdh=None, pdl=None) -> DayState:
         state = self.state
+        if pdh is not None and pdl is not None:
+            state.eq = (float(pdh) + float(pdl)) / 2.0
+            if spot is not None:
+                state.eq_bias = "long-preferred" if spot >= state.eq else "short-preferred"
         if orb_mid is not None:
             state.orb_mid = float(orb_mid)
         if candles:

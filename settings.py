@@ -30,6 +30,20 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 CAPITAL = float(os.getenv("CAPITAL", "100000"))  # risk accounting (Phase B/C)
 
+# --- SmartAPI / Angel One Auth & Execution Settings ---
+SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip() or os.getenv("ANGEL_API_KEY", "").strip()
+SMARTAPI_CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "").strip() or os.getenv("ANGEL_CLIENT_ID", "").strip()
+SMARTAPI_REDIRECT_URL = os.getenv("SMARTAPI_REDIRECT_URL", "").strip()
+SMARTAPI_CALLBACK_HOST = os.getenv("SMARTAPI_CALLBACK_HOST", "127.0.0.1").strip()
+SMARTAPI_CALLBACK_PORT = int(os.getenv("SMARTAPI_CALLBACK_PORT", "8000"))
+
+# --- Execution mode (Strict Paper Mode Safeguard) ---
+# Values: PAPER (default, mandatory) | LIVE (DISABLED / GATED)
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "PAPER").strip().upper()
+CONFIG_VERSION = "FROZEN-v1"
+REAL_MONEY_GATE = "BLOCKED"
+SYSTEM_STATUS = "PAPER ONLY"
+
 # --- Symbol ---
 NIFTY_SYMBOL = "NIFTY"
 

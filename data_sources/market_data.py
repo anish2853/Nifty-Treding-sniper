@@ -141,20 +141,7 @@ class MarketDataStore:
         status = {"fresh_candles": [], "fresh_minutes": [],
               "chain_ok": False, "vix_ok": False}
 
-        # 1) candles (chart API, sample fallback inside the engine)
-        fresh = []
-        try:
-            fresh = self.candle_engine.refresh(now=now)
-        except Exception as exc:
-            log.warning("candle refresh failed: %s", exc)
-        self.candles = self.candle_engine.candles
-        status["fresh_candles"] = fresh
-        status["fresh_minutes"] = self.candle_engine.fresh_minutes
-        status["candles"] = len(self.candles)
-        self.health.record("nse_chart", self.candle_engine.chart_ok
-                           or bool(self.candles))
-
-        # 2) option chain - validated BEFORE anything consumes it
+        # 1) option chain - validated BEFORE anything consumes it (feeds live spot to candle engine)
         raw, _http, tried = (fetch_option_chain_with_retries(self._session)
                              if self._session else (None, None, []))
         self.chain_poll_ts = ist_now().isoformat(timespec="seconds")
@@ -175,11 +162,28 @@ class MarketDataStore:
             self.chain = snapshot
             self.chain_source = "live NSE v3 flow"
             self.spot = StoredValue(snapshot.underlying, iso, "chain-underlying")
+            # Feed underlying spot sample directly to candle engine (Phase 13.5 synthesis)
+            self.candle_engine.add_spot_sample(snapshot.underlying, ts=now, source="chain")
             from data_sources.nse_chain import select_trade_expiry
             self.trade_expiry, self.trade_expiry_days = select_trade_expiry(
                 snapshot.expiry_dates, now.date(), self.holidays)
             status["chain_ok"] = True
+        elif self.spot and self.spot.value:
+            self.candle_engine.add_spot_sample(self.spot.value, ts=now, source=self.spot.source)
         status["chain_rejected"] = raw is not None and snapshot is None
+
+        # 2) candles (chart API primary, chain synthesis fallback inside the engine)
+        fresh = []
+        try:
+            fresh = self.candle_engine.refresh(now=now)
+        except Exception as exc:
+            log.warning("candle refresh failed: %s", exc)
+        self.candles = self.candle_engine.candles
+        status["fresh_candles"] = fresh
+        status["fresh_minutes"] = self.candle_engine.fresh_minutes
+        status["candles"] = len(self.candles)
+        self.health.record("nse_chart", self.candle_engine.chart_ok
+                           or bool(self.candles))
 
         # 3) India VIX
         vix_info = india_vix(self._session) if self._session else None
@@ -231,3 +235,9 @@ class MarketDataStore:
         pdc = f"{self.pdc:,.2f}" if self.pdc else "MISSING"
         ts = (self.last_refresh or ist_now().isoformat(timespec="seconds"))[11:19]
         return f"spot {spot} | PDC {pdc} | store {ts} IST"
+
+    def latest_candle_age_minutes(self, now: datetime | None = None) -> float | None:
+        return self.candle_engine.latest_candle_age_minutes(now=now)
+
+    def is_candle_engine_blind(self, now: datetime | None = None) -> bool:
+        return self.candle_engine.is_blind(now=now)

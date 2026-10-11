@@ -83,6 +83,21 @@ class NSESession:
             log.warning("NSE handshake failed for %s: %s", _HANDSHAKE_URL, exc)
         return bool(self._session.cookies)
 
+    def recreate_session(self) -> bool:
+        """Create a fresh requests.Session and perform handshake.
+        Used when Akamai invalidates session cookies or returns 401/403/429."""
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": settings.NSE_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+        })
+        return self.warm_up()
+
     # -- JSON GETs ------------------------------------------------------------
     def get_json(self, url: str):
         """Rate-limited GET returning parsed JSON, or None after retries. Never raises.

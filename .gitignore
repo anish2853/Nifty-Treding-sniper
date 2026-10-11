@@ -2,5 +2,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+*.env
+config/.env
+*.session.json
+.smartapi_session.json
 data/
 logs/
+cloudflared.exe
+
+

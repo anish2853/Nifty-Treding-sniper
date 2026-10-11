@@ -154,3 +154,434 @@ def trading_halted(reason: str) -> str:
 
 def skipped_alert(*, side: str, level: str, reason: str, score) -> str:
     return f"🚫 SKIPPED: {side} break {level} | reason: {reason} | score {score}"
+
+
+def explainable_trade_signal(
+    *,
+    strategy: str,
+    direction: str,
+    regime: str,
+    entry_range: str,
+    sl_spot: str,
+    risk_r: str,
+    management: str,
+    evidence_items: list[str],
+    invalidation_items: list[str],
+    trade_id: str | None = None,
+    next_liquidity_target: str | None = None,
+) -> str:
+    """Master explainable trade signal alert (Project Bible Section 35).
+    Zero hallucinations: any missing metric is explicitly marked as unavailable."""
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🎯 NIFTY SNIPER — TRADE SIGNAL",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Strategy:   {strategy}",
+        f"Direction:  {direction}",
+        f"Regime:     {regime}",
+        f"Entry:      {entry_range}",
+        f"SL:         {sl_spot}",
+        f"Risk:       {risk_r}",
+        f"Management: {management}",
+    ]
+    if next_liquidity_target:
+        lines.append(f"Target:     {next_liquidity_target}")
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "WHY THIS TRADE?",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ])
+    for idx, item in enumerate(evidence_items, 1):
+        lines.append(f"{idx}. {item}")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "INVALIDATION",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ])
+    for item in invalidation_items:
+        lines.append(f"• {item}")
+
+    id_txt = f" | ID: {trade_id}" if trade_id else ""
+    lines.extend([
+        f"⏰ {_hhmm()} IST{id_txt}",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ])
+    return "\n".join(lines)
+
+
+def no_trade_alert(*, strategy: str, candidate_direction: str, reason: str) -> str:
+    """Informative alert when an active setup candidate is rejected (Section 36)."""
+    return (
+        f"ℹ️ NO TRADE — {_hhmm()} IST\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Candidate: {strategy} ({candidate_direction})\n"
+        f"Reason:    {reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def trade_management_update(
+    *,
+    strategy: str,
+    direction: str,
+    entry_price: float,
+    current_price: float,
+    current_r: float,
+    trend_status: str = "VALID",
+    structure: str = "5m bearish",
+    next_liquidity: str = "—",
+    action: str = "HOLD + TRAIL",
+    reason: str = "Structure swing updated",
+    trade_id: str | None = None,
+) -> str:
+    """Material trade update alert for active runner management (Phase 4 Section 23)."""
+    id_line = f" | ID: {trade_id}" if trade_id else ""
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"NIFTY SNIPER\n"
+        f"TRADE UPDATE — {_hhmm()} IST{id_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{strategy}\n"
+        f"{direction}\n\n"
+        f"Entry:     {entry_price:.2f}\n"
+        f"Current:   {current_price:.2f}\n"
+        f"Current R: {current_r:+.2f}R\n\n"
+        f"Trend:\n"
+        f"{trend_status}\n\n"
+        f"Structure:\n"
+        f"{structure}\n\n"
+        f"Next liquidity:\n"
+        f"{next_liquidity}\n\n"
+        f"Action:\n"
+        f"{action}\n\n"
+        f"Reason:\n"
+        f"{reason}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_telegram_trade_signal(
+    *,
+    strategy: str,
+    direction: str,
+    regime: str,
+    entry: float | str,
+    initial_sl: float | str,
+    risk: float | str,
+    score: float | int | str,
+    reasons: list[str],
+    next_liquidity: str,
+    room: float | str,
+    invalidation: str,
+    confidence: str,
+    strike: int | str | None = None,
+    expiry: str | None = None,
+    entry_prem: float | None = None,
+    sl_prem: float | None = None,
+    tgt1_prem: float | None = None,
+    tgt2_prem: float | None = None,
+    tgt1_spot: float | None = None,
+    tgt2_spot: float | None = None,
+    rr_ratio: float | None = None,
+    max_risk_rs: float | None = None,
+) -> str:
+    """Exact Phase 5 Section 5 Trade Signal format with Mandatory Option Leg & Targets (Phase 13.4)."""
+    entry_str = f"{entry:.2f}" if isinstance(entry, float) else str(entry)
+    sl_str = f"{initial_sl:.2f}" if isinstance(initial_sl, float) else str(initial_sl)
+    risk_str = f"{risk:.1f}R" if isinstance(risk, float) else str(risk)
+    score_str = str(score)
+    room_str = f"{room:.0f} pts" if isinstance(room, (int, float)) else str(room)
+
+    why_lines = "\n".join(f"✓ {r}" for r in reasons)
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        "NIFTY SNIPER",
+        "TRADE SIGNAL",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Strategy:\n{strategy}",
+        "",
+        f"Direction:\n{direction}",
+    ]
+
+    # Mandatory Option Leg (Phase 13.3 + 13.4)
+    if strike and entry_prem is not None:
+        side = "CE" if direction == "LONG" else "PE"
+        exp_txt = f" (Expiry: {expiry})" if expiry else ""
+        prem_band = f"₹{entry_prem:.2f}–₹{entry_prem + 10.0:.2f}"
+        sl_prem_txt = f"₹{sl_prem:.2f}" if sl_prem is not None else f"₹{entry_prem * 0.75:.2f}"
+        lines.extend([
+            "",
+            f"Instrument:\nBUY {strike} {side}{exp_txt}",
+            "",
+            f"Entry:\nSpot {entry_str} | Prem {prem_band}",
+            "",
+            f"SL:\nPrem {sl_prem_txt} (Spot ref: {sl_str})",
+        ])
+        if tgt1_prem is not None and tgt2_prem is not None:
+            tgt1_spot_txt = f"Spot {tgt1_spot:.1f} → " if tgt1_spot else ""
+            tgt2_spot_txt = f"Spot {tgt2_spot:.1f} → " if tgt2_spot else ""
+            rr_txt = f" | R:R 1:{rr_ratio:.1f}" if rr_ratio else ""
+            lines.extend([
+                "",
+                f"Targets{rr_txt}:\nTGT1: {tgt1_spot_txt}Prem ₹{tgt1_prem:.2f} (Book 50%, SL to entry)\nTGT2: {tgt2_spot_txt}Prem ₹{tgt2_prem:.2f} (Runner exit)",
+            ])
+        if max_risk_rs is not None:
+            lines.extend([
+                "",
+                f"Max Risk:\n₹{max_risk_rs:,.0f} (1 lot = {settings.LOT_SIZE} qty)",
+            ])
+    else:
+        lines.extend([
+            "",
+            f"Entry:\n{entry_str}",
+            "",
+            f"Initial SL:\n{sl_str}",
+        ])
+
+    lines.extend([
+        "",
+        f"Regime:\n{regime}",
+        "",
+        f"Risk:\n{risk_str}",
+        "",
+        f"Score:\n{score_str}",
+        "",
+        f"WHY:\n{why_lines}",
+        "",
+        f"NEXT LIQUIDITY:\n{next_liquidity}",
+        "",
+        f"ROOM:\n{room_str}",
+        "",
+        f"INVALIDATION:\n{invalidation}",
+        "",
+        f"CONFIDENCE:\n{confidence}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ])
+    return "\n".join(lines)
+
+
+def format_telegram_trade_exit(
+    *,
+    strategy: str,
+    direction: str,
+    entry: float | str,
+    exit_price: float | str,
+    result_r: float | str,
+    mfe_r: float | str,
+    mae_r: float | str,
+    exit_reason: str,
+    thesis: str = "VALID",
+) -> str:
+    """Exact Phase 5 Section 8 Trade Exit format."""
+    entry_str = f"{entry:.2f}" if isinstance(entry, float) else str(entry)
+    exit_str = f"{exit_price:.2f}" if isinstance(exit_price, float) else str(exit_price)
+    res_str = f"{result_r:+.2f}R" if isinstance(result_r, float) else str(result_r)
+    mfe_str = f"{mfe_r:+.2f}R" if isinstance(mfe_r, float) else str(mfe_r)
+    mae_str = f"{mae_r:+.2f}R" if isinstance(mae_r, float) else str(mae_r)
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "NIFTY SNIPER\n"
+        "TRADE EXIT\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Strategy:\n{strategy}\n\n"
+        f"Direction:\n{direction}\n\n"
+        f"Entry:\n{entry_str}\n\n"
+        f"Exit:\n{exit_str}\n\n"
+        f"Result:\n{res_str}\n\n"
+        f"MFE:\n{mfe_str}\n\n"
+        f"MAE:\n{mae_str}\n\n"
+        f"Exit reason:\n{exit_reason}\n\n"
+        f"Thesis:\n{thesis}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_telegram_trade_update(
+    *,
+    strategy: str,
+    direction: str,
+    entry: float | str,
+    current: float | str,
+    current_r: float | str,
+    trend: str = "VALID",
+    structure: str = "5m bearish",
+    next_liquidity: str = "—",
+    action: str = "HOLD + TRAIL",
+    reason: str = "New lower-high confirmed",
+) -> str:
+    """Exact Phase 5 Section 7 Trade Update format."""
+    entry_str = f"{entry:.0f}" if isinstance(entry, float) else str(entry)
+    curr_str = f"{current:.0f}" if isinstance(current, float) else str(current)
+    r_str = f"{current_r:+.1f}R" if isinstance(current_r, float) else str(current_r)
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "NIFTY SNIPER\n"
+        "TRADE UPDATE\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{strategy} {direction}\n\n"
+        f"Entry:\n{entry_str}\n\n"
+        f"Current:\n{curr_str}\n\n"
+        f"Current R:\n{r_str}\n\n"
+        f"Trend:\n{trend}\n\n"
+        f"Structure:\n{structure}\n\n"
+        f"Next liquidity:\n{next_liquidity}\n\n"
+        f"Action:\n{action}\n\n"
+        f"Reason:\n{reason}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_critical_system_halt(reason: str) -> str:
+    """Exact Phase 5 Section 27 Critical System Halt format."""
+    return f"CRITICAL SYSTEM HALT\n\nReason:\n{reason}"
+
+
+def format_data_blind_alert(detail: str) -> str:
+    """Exact Phase 5 Section 23 Data Blindness format."""
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🚨 DATA BLINDNESS ALERT\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Candle feed lag > 5 min during market hours.\n"
+        f"Trading HALTED. No new trades allowed.\n\n"
+        f"Detail: {detail}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ---- MODEL A SNIPER PRODUCTION TELEGRAM ALERTS (OPTIONS DRIVEN) ----
+
+def format_sniper_entry_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    setup_name: str,
+    entry_price: float,
+    initial_sl: float,
+    risk_pts: float,
+    tgt1_price: float,
+    tgt2_price: float,
+    fib_50: float = 0.0,
+    fib_618: float = 0.0,
+    notes: str = "",
+    strike: int = 0,
+    option_type: str = "",
+    option_symbol: str = "",
+    entry_prem: float = 0.0,
+    sl_prem: float = 0.0,
+    tgt1_prem: float = 0.0,
+    tgt2_prem: float = 0.0,
+) -> str:
+    """🎯 Production Telegram alert for Model A Option Trade Entry."""
+    side_badge = "🟢 BUY CE (CALL)" if direction == "LONG" else "🔴 BUY PE (PUT)"
+    opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else side_badge)
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    prem_txt = f"₹{entry_prem:.1f} – ₹{entry_prem + 10.0:.1f}" if entry_prem > 0 else "Market Order"
+    sl_prem_txt = f"₹{sl_prem:.1f}" if sl_prem > 0 else "—"
+    tgt1_prem_txt = f"₹{tgt1_prem:.1f}" if tgt1_prem > 0 else "—"
+    tgt2_prem_txt = f"₹{tgt2_prem:.1f}" if tgt2_prem > 0 else "—"
+    capital_txt = f"₹{entry_prem * lot_size:,.0f}" if entry_prem > 0 else "—"
+    fib_txt = f"Golden Pocket: [{min(fib_50, fib_618):.1f} – {max(fib_50, fib_618):.1f}]\n" if fib_50 > 0 else ""
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 NIFTY SNIPER — OPTION TRADE ENTRY\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {opt_name}\n"
+        f"ACTION: {side_badge} at {prem_txt}\n"
+        f"LOT SIZE: {lot_size} Qty (1 Lot) | Capital: ~{capital_txt}\n\n"
+        f"• Entry Spot: ₹{entry_price:.1f}\n"
+        f"• Stop Loss: {sl_prem_txt} Prem (Spot ref: ₹{initial_sl:.1f} | Risk: {risk_pts:.1f} pts)\n"
+        f"• Target 1: {tgt1_prem_txt} Prem (Spot ref: ₹{tgt1_price:.1f})\n"
+        f"  ↳ BOOK 50% PROFIT, MOVE SL TO BREAKEVEN (BE_SL)\n"
+        f"• Target 2: {tgt2_prem_txt} Prem (Spot ref: ₹{tgt2_price:.1f})\n"
+        f"  ↳ RUNNER EXIT\n\n"
+        f"{fib_txt}"
+        f"Setup: {setup_name}\n"
+        f"Trade ID: {trade_id}\n"
+        f"Rule: Zero Counter-Trend Trades | Time Gate Active\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_sniper_tgt1_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    entry_price: float,
+    tgt1_price: float,
+    tgt2_price: float,
+    strike: int = 0,
+    option_type: str = "",
+    option_symbol: str = "",
+    entry_prem: float = 0.0,
+    tgt1_prem: float = 0.0,
+    tgt2_prem: float = 0.0,
+) -> str:
+    """🎯 Production Telegram alert when Target 1 is hit (50% locked + BE_SL)."""
+    opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else ("CE LONG" if direction == "LONG" else "PE SHORT"))
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    gain_pts = max(0.0, tgt1_prem - entry_prem) if (tgt1_prem and entry_prem) else 0.0
+    gain_rupees = gain_pts * lot_size
+    gain_txt = f" (+{gain_pts:.1f} pts | +₹{gain_rupees:,.0f}/lot)" if gain_pts > 0 else ""
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 TARGET 1 HIT — 50% PROFIT BOOKED\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {opt_name} ({trade_id})\n"
+        f"Target 1 Hit at: ₹{tgt1_prem:.1f} Prem{gain_txt}\n"
+        f"Spot Index: ₹{tgt1_price:.1f}\n\n"
+        f"✅ ACTION: Book 50% Quantity Now (+1.0R Locked)\n"
+        f"🛡️ STOP MOVED TO ENTRY: ₹{entry_prem:.1f} (Breakeven BE_SL)\n\n"
+        f"• Status: Risk completely eliminated! Worst-case exit = +0.50R net\n"
+        f"• Runner Target 2: ₹{tgt2_prem:.1f} Prem (Spot ref: ₹{tgt2_price:.1f})\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_sniper_exit_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    entry_price: float,
+    exit_price: float,
+    realized_r: float,
+    exit_reason: str,
+    notes: str = "",
+    strike: int = 0,
+    option_type: str = "",
+    option_symbol: str = "",
+    entry_prem: float = 0.0,
+    exit_prem: float = 0.0,
+) -> str:
+    """🚨 Production Telegram alert for Model A Option Trade Exit."""
+    opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else ("CE LONG" if direction == "LONG" else "PE SHORT"))
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    res_badge = f"✅ {realized_r:+.2f} R" if realized_r > 0 else (f"🛡️ BE {realized_r:+.2f} R" if realized_r == 0 else f"❌ {realized_r:+.2f} R")
+    pnl_pts = (exit_prem - entry_prem) if (exit_prem and entry_prem) else 0.0
+    pnl_rs = pnl_pts * lot_size
+    pnl_txt = f" ({pnl_pts:+.1f} pts | ₹{pnl_rs:+,.0f}/lot)" if pnl_pts != 0 else ""
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🚨 NIFTY SNIPER — OPTION TRADE CLOSED\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {opt_name} ({trade_id})\n"
+        f"Buy Premium: ₹{entry_prem:.1f} | Exit Premium: ₹{exit_prem:.1f}\n"
+        f"Spot Entry: ₹{entry_price:.1f} | Spot Exit: ₹{exit_price:.1f}\n\n"
+        f"OUTCOME: {res_badge}{pnl_txt}\n"
+        f"Exit Reason: {exit_reason}\n"
+        f"Notes: {notes or '—'}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+

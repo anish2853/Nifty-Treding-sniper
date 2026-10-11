@@ -22,6 +22,8 @@ from collections import defaultdict
 
 import settings
 from engines.replay_60day import ReplaySession
+from journal.replay_store import (DataIntegrityError, fetch_trades, stats_for_run,
+                                  verify_run_integrity)
 
 
 COST_PER_TRADE_INR = 150  # Transaction cost per trade
@@ -112,74 +114,52 @@ class GateCheckResult:
 class StatsCalculator:
     """Accumulate and report replay statistics."""
     
-    def __init__(self, session: ReplaySession, replay_db_path: str | None = None):
+    def __init__(self, session: ReplaySession, replay_db_path: str | None = None,
+                 run_id: str | None = None):
         self.session = session
+        self.run_id = run_id or session.run_id
         self.replay_db_path = replay_db_path or str(settings.DATA_DIR / "replay_journal.sqlite3")
         self.trades: list = []
         self.families: dict[str, FamilyStats] = {}
         self.states: dict[str, FamilyStats] = {}
         self.directions: dict[str, FamilyStats] = {}
         self.months: dict[str, FamilyStats] = {}
+        self.integrity: dict = {}
         self._load_trades()
         self._compute_stats()
-    
+
     def _load_trades(self):
-        """Load all trades from replay journal and apply cost deduction."""
+        """Load ONE run_id from replay journal; abort if duplicates exist."""
+        conn = sqlite3.connect(f"file:{self.replay_db_path}?immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
         try:
-            conn = sqlite3.connect(f"file:{self.replay_db_path}?immutable=1", uri=True)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM replay_trades
-                ORDER BY replay_date, entry_time
-            """)
-            rows = cursor.fetchall()
-            
-            for row in rows:
-                trade = {
-                    "date": row["replay_date"],
-                    "family": row["family"],
-                    "direction": row["direction"],
-                    "entry_time": row["entry_time"],
-                    "entry_price": row["entry_price"],
-                    "exit_time": row["exit_time"],
-                    "exit_price": row["exit_price"],
-                    "exit_reason": row["exit_reason"],
-                    "result_r": row["result_r"] or 0.0,
-                    "day_state": row["day_state"],
-                    "notes": row["notes"],
-                }
-                
-                # Apply cost deduction (₹150 per trade)
-                # Assuming standard position size; cost translates to ~0.3-0.5R depending on strike
-                cost_r = COST_PER_TRADE_INR / 300.0  # rough 300 rupees per 1R
-                trade["result_r_after_cost"] = trade["result_r"] - cost_r
-                trade["result_inr"] = trade["result_r"] * 300.0  # rough conversion
-                trade["result_inr_after_cost"] = trade["result_inr"] - COST_PER_TRADE_INR
-                
-                self.trades.append(trade)
-            
+            self.integrity = verify_run_integrity(conn, self.run_id)
+        except DataIntegrityError as exc:
             conn.close()
-        except FileNotFoundError:
-            # Fall back to session data if DB not found
-            for family, trades in self.session.trades_by_family.items():
-                for trade in trades:
-                    result_r = trade.result_r or 0.0
-                    cost_r = COST_PER_TRADE_INR / 300.0
-                    self.trades.append({
-                        "date": trade.day,
-                        "family": family,
-                        "direction": trade.direction,
-                        "entry_time": trade.entry_time.isoformat() if trade.entry_time else None,
-                        "entry_price": trade.entry,
-                        "exit_time": trade.exit_time.isoformat() if trade.exit_time else None,
-                        "exit_price": trade.exit_spot,
-                        "exit_reason": trade.exit_reason,
-                        "result_r": result_r,
-                        "result_r_after_cost": result_r - cost_r,
-                        "day_state": "UNKNOWN",
-                        "notes": trade.notes,
-                    })
+            raise DataIntegrityError(
+                f"DATA INTEGRITY error for run {self.run_id}: {exc}") from exc
+
+        for row in fetch_trades(conn, self.run_id):
+            trade = {
+                "date": row["replay_date"],
+                "family": row["family"],
+                "direction": row["direction"],
+                "entry_time": row["entry_time"],
+                "entry_price": row["entry_price"],
+                "sl_spot": row["sl_spot"] if row["sl_spot"] is not None else 0.0,
+                "exit_time": row["exit_time"],
+                "exit_price": row["exit_price"],
+                "exit_reason": row["exit_reason"],
+                "result_r": row["result_r"] or 0.0,
+                "day_state": row["day_state"],
+                "notes": row["notes"],
+            }
+            cost_r = COST_PER_TRADE_INR / 300.0
+            trade["result_r_after_cost"] = trade["result_r"] - cost_r
+            trade["result_inr"] = trade["result_r"] * 300.0
+            trade["result_inr_after_cost"] = trade["result_inr"] - COST_PER_TRADE_INR
+            self.trades.append(trade)
+        conn.close()
     
     def _compute_stats(self):
         """Aggregate trades by family, state, direction, month."""
@@ -281,7 +261,13 @@ class StatsCalculator:
         total_trades = len(self.trades)
         if total_trades == 0:
             return "# 60-Day Replay Report\n\n**ERROR**: No trades found in replay journal.\n"
-        
+
+        unique_n = self.integrity.get("unique", total_trades)
+        if unique_n != total_trades:
+            return (f"# 60-Day Replay Report\n\n**DATA INTEGRITY ERROR**: "
+                    f"journal rows {total_trades} != unique trades {unique_n}. "
+                    f"Stats aborted.\n")
+
         total_r = sum(t["result_r_after_cost"] for t in self.trades)
         total_inr = sum(t.get("result_inr_after_cost", 0) for t in self.trades)
         expectancy = total_r / total_trades
@@ -313,14 +299,16 @@ class StatsCalculator:
         report = f"""# 60-Day Replay Report
 
 **MODE**: PRICE-ONLY VARIANT | threshold: 52/65
+**Run ID**: {self.run_id}
 **Period**: {self.session.start_date} to {self.session.end_date}
-**Days Replayed**: {self.session.days_replayed} / {len(self.trades) if self.trades else 0} days
+**Days Replayed**: {self.session.days_replayed}
 
 ## Headline Results
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | {total_trades} |
+| Trades (unique) | {total_trades} |
+| Journal rows | {self.integrity.get('rows', total_trades)} |
 | Win Rate | {win_rate:.1f}% ({wins}W / {losses}L) |
 | Avg Win (R) | {(sum([t['result_r_after_cost'] for t in self.trades if t['result_r_after_cost'] > 0]) / wins) if wins > 0 else 0.0:+.2f}R |
 | Avg Loss (R) | {(sum([t['result_r_after_cost'] for t in self.trades if t['result_r_after_cost'] < 0]) / losses) if losses > 0 else 0.0:+.2f}R |

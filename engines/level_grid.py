@@ -52,13 +52,16 @@ def build_level_grid(*, spot, pdh=None, pdl=None, pdc=None, orb=None,
             ("PDC", pdc, "R" if pdc is not None and pdc >= spot else "S")):
         if price is not None:
             structures.append((label, float(price), side))
+    if pdh is not None and pdl is not None:
+        eq = (float(pdh) + float(pdl)) / 2.0
+        structures.append(("EQ", float(eq), "S" if spot >= eq else "R"))
     if orb:
         structures.extend((label, float(orb[key]), side) for label, key, side in
                           (("ORB-H", "high", "R"), ("ORB-L", "low", "S")))
     structures.extend((label, price, side)
                        for _level_id, label, price, side in _pivot_levels(candles))
 
-    result = [GridLevel(label, label, price, side, (label,))
+    result = [GridLevel(label, label, price, side, (label,), strong=(label in ("PDH", "PDL", "EQ")))
               for label, price, side in structures]
     if vwap is not None:
         result.append(GridLevel("VWAP", "VWAP", float(vwap),

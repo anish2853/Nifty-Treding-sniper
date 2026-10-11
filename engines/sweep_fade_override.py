@@ -23,7 +23,7 @@ class SweepFadeOverride:
 def is_strong_level(level: float, pdh: float | None, pdl: float | None,
                    oi_wall_strikes: list[float], spot: float) -> bool:
     """Level is strong if it aligns with PDH, PDL, or OI wall within tolerance."""
-    tol = settings.LEVEL_CONFLUENCE_TOL_PTS  # typically 20 pts
+    tol = 20  # 20 pts tolerance for confluence
     
     confluences = 0
     if pdh and abs(level - pdh) < tol:

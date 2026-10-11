@@ -179,16 +179,25 @@ class EntryEngine:
                 ev.rejected = True
                 ev.reject_reason = f"fresh writing wall beyond spot ({ev.oi_detail})"
 
+            from engines.short_gating import evaluate_short_gate
+            short_gated = ctx.get("short_gated", True)
+            gate_allowed, risk_units, gate_tag, gate_reason = evaluate_short_gate(
+                direction, ev.score, level_name=ev.level_name, is_gated=short_gated
+            )
+
             caps_ok, caps_note = ctx["caps_ok"](direction)
-            ev.caps_note = caps_note
+            ev.caps_note = f"{caps_note} | {gate_tag}".strip(" |") if gate_tag else caps_note
             ltp = ctx["option_ltp"](direction, spot)
             ev.fired = (ev.broke and not ev.rejected
                         and ev.score >= settings.ENTRY_SCORE_FIRE
+                        and gate_allowed
                         and regime_ok and caps_ok and ltp is not None)
-            if ev.broke and not ev.rejected and not ev.fired \
-                    and ev.score >= settings.ENTRY_SCORE_FIRE:
-                ev.blocked_note = caps_note or ("option LTP unavailable" if ltp is None
-                                                else "regime blocked")
+            if ev.broke and not ev.rejected and not ev.fired:
+                if not gate_allowed:
+                    ev.blocked_note = gate_reason
+                elif ev.score >= settings.ENTRY_SCORE_FIRE:
+                    ev.blocked_note = caps_note or ("option LTP unavailable" if ltp is None
+                                                    else "regime blocked")
             ev.near_miss = (ev.broke and not ev.rejected and not ev.fired
                             and settings.ENTRY_SCORE_JOURNAL_MIN <= ev.score
                             < settings.ENTRY_SCORE_FIRE)
