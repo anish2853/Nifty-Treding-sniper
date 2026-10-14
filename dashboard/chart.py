@@ -56,6 +56,8 @@ def build_liquidity_sniper_chart(
     val: float | None = None,
     poc: float | None = None,
     show_session_breaks: bool = True,
+    height: int = 400,
+    zones: list[dict] | None = None,
 ) -> go.Figure:
     """Build ultra-clean Plotly candlestick chart with upside/downside entry symbols, FRVP, and Golden Pocket."""
     if not candles:
@@ -65,7 +67,7 @@ def build_liquidity_sniper_chart(
             showarrow=False,
             font=dict(size=16, color="gray"),
         )
-        fig.update_layout(template="plotly_dark", height=540)
+        fig.update_layout(template="plotly_dark", height=height)
         return fig
 
     fig = go.Figure()
@@ -73,6 +75,23 @@ def build_liquidity_sniper_chart(
     # Normalize candle timestamps to naive datetime to prevent tz discrepancies
     x_candles = [c.start.replace(tzinfo=None) if hasattr(c.start, "replace") else c.start for c in candles]
     session_date = candles[0].start.date() if hasattr(candles[0].start, "date") else None
+
+    # Calculate session time bounds so early-morning candles never balloon into giant blocks
+    if session_date is not None:
+        session_start = datetime(session_date.year, session_date.month, session_date.day, 9, 10)
+        session_end = datetime(session_date.year, session_date.month, session_date.day, 15, 35)
+        view_start = session_start
+        if len(candles) <= 12:  # First hour: comfortable 2.5h window
+            view_end = datetime(session_date.year, session_date.month, session_date.day, 11, 45)
+        elif len(candles) <= 30:  # Mid-morning: up to 13:30
+            view_end = datetime(session_date.year, session_date.month, session_date.day, 13, 30)
+        else:
+            view_end = session_end
+    else:
+        session_start = x_candles[0] - timedelta(minutes=5)
+        session_end = x_candles[-1] + timedelta(minutes=5)
+        view_start = session_start
+        view_end = session_end
 
     # 1. Main Candlestick trace
     fig.add_trace(go.Candlestick(
@@ -86,9 +105,9 @@ def build_liquidity_sniper_chart(
         decreasing_line_color="#ff5252",
     ))
 
-    # 2. PDH & PDL reference lines
-    x_start = x_candles[0]
-    x_end = x_candles[-1]
+    # 2. Reference lines span the entire session forward
+    x_start = session_start
+    x_end = session_end
 
     if pdh is not None and pdh > 0:
         fig.add_shape(
@@ -96,7 +115,7 @@ def build_liquidity_sniper_chart(
             line=dict(color="rgba(244, 67, 54, 0.75)", width=1.5, dash="dash"),
         )
         fig.add_annotation(
-            x=x_start, y=pdh, text=f"🔴 PDH: {pdh:.1f}",
+            x=view_start, y=pdh, text=f"🔴 PDH: {pdh:.1f}",
             showarrow=False, xanchor="left", yanchor="bottom",
             font=dict(size=10, color="#f44336"),
         )
@@ -107,7 +126,7 @@ def build_liquidity_sniper_chart(
             line=dict(color="rgba(76, 175, 80, 0.75)", width=1.5, dash="dash"),
         )
         fig.add_annotation(
-            x=x_start, y=pdl, text=f"🟢 PDL: {pdl:.1f}",
+            x=view_start, y=pdl, text=f"🟢 PDL: {pdl:.1f}",
             showarrow=False, xanchor="left", yanchor="top",
             font=dict(size=10, color="#4caf50"),
         )
@@ -119,7 +138,7 @@ def build_liquidity_sniper_chart(
             line=dict(color="#ba68c8", width=1.5, dash="dashdot"),
         )
         fig.add_annotation(
-            x=x_end, y=vah, text=f"🟣 VAH: {vah:.1f} (Value Area High 70%)",
+            x=view_end, y=vah, text=f"🟣 VAH: {vah:.1f} (Value Area High 70%)",
             showarrow=False, xanchor="right", yanchor="bottom",
             font=dict(size=10, color="#ba68c8"),
         )
@@ -130,7 +149,7 @@ def build_liquidity_sniper_chart(
             line=dict(color="#ffca28", width=1.5, dash="dot"),
         )
         fig.add_annotation(
-            x=x_end, y=poc, text=f"🟡 POC: {poc:.1f} (Point of Control)",
+            x=view_end, y=poc, text=f"🟡 POC: {poc:.1f} (Point of Control)",
             showarrow=False, xanchor="right", yanchor="bottom",
             font=dict(size=10, color="#ffca28"),
         )
@@ -141,10 +160,44 @@ def build_liquidity_sniper_chart(
             line=dict(color="#26c6da", width=1.5, dash="dashdot"),
         )
         fig.add_annotation(
-            x=x_end, y=val, text=f"🔵 VAL: {val:.1f} (Value Area Low 70%)",
+            x=view_end, y=val, text=f"🔵 VAL: {val:.1f} (Value Area Low 70%)",
             showarrow=False, xanchor="right", yanchor="top",
             font=dict(size=10, color="#26c6da"),
         )
+
+    # 2b. Phase 15 STRONG Liquidity Zones (10-30 pts, drawn, labeled, STRONG-tagged)
+    if zones:
+        for z in zones:
+            z_low = float(z.get("zone_low", 0.0))
+            z_high = float(z.get("zone_high", 0.0))
+            if z_low <= 0 or z_high <= 0:
+                continue
+            z_type = z.get("zone_type", "SUPPORT")
+            k = z.get("anchor_strike", int((z_low + z_high) / 2))
+            is_sup = (z_type == "SUPPORT")
+            fill_col = "rgba(76, 175, 80, 0.12)" if is_sup else "rgba(244, 67, 54, 0.12)"
+            line_col = "rgba(76, 175, 80, 0.45)" if is_sup else "rgba(244, 67, 54, 0.45)"
+            tag = z.get("tag", "STRONG")
+            txt = f"🟢 SUPPORT {k} [{tag}]" if is_sup else f"🔴 RESISTANCE {k} [{tag}]"
+
+            fig.add_shape(
+                type="rect",
+                x0=x_start,
+                x1=x_end,
+                y0=z_low,
+                y1=z_high,
+                fillcolor=fill_col,
+                line=dict(color=line_col, width=1, dash="dot"),
+            )
+            fig.add_annotation(
+                x=view_start,
+                y=(z_low + z_high) / 2,
+                text=txt,
+                showarrow=False,
+                xanchor="left",
+                yanchor="middle",
+                font=dict(size=9, color="#81c784" if is_sup else "#e57373"),
+            )
 
     # 2c. Session Breaks (09:15 Open Vertical Marker)
     if show_session_breaks:
@@ -352,8 +405,12 @@ def build_liquidity_sniper_chart(
         xaxis_title="Time (IST)",
         yaxis_title="NIFTY Spot Price",
         template="plotly_dark",
-        height=560,
+        height=height,
         margin=dict(l=40, r=40, t=50, b=40),
         xaxis_rangeslider_visible=False,
+    )
+    fig.update_xaxes(
+        range=[view_start, view_end],
+        rangeslider_visible=False,
     )
     return fig

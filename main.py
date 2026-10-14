@@ -25,6 +25,7 @@ import json
 import logging
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime, time as dt_time
 from pathlib import Path
 
@@ -92,12 +93,38 @@ def round_to_strike(spot: float) -> int:
 
 def option_ltp_for(snapshot, strike: int, direction: str, expiry: str | None = None):
     """Option LTP at one strike from a chain snapshot (trade expiry by default)."""
-    if snapshot is None:
+    if snapshot is None or not getattr(snapshot, "rows", None):
         return None
-    want = expiry or snapshot.nearest_expiry
+
+    want = expiry or getattr(snapshot, "trade_expiry", None) or getattr(snapshot, "nearest_expiry", None)
+    want_norm = str(want).strip().upper() if want else ""
+    target_strike = int(round(strike))
+
+    # 1. Exact or case-insensitive match on requested/nearest expiry
+    if want_norm:
+        for row in snapshot.rows:
+            if int(round(row.strike)) == target_strike and str(row.expiry).strip().upper() == want_norm:
+                ltp = row.ce_ltp if direction == "LONG" else row.pe_ltp
+                if ltp is not None and ltp > 0:
+                    return ltp
+
+    # 2. Try snapshot.nearest_expiry
+    nearest = getattr(snapshot, "nearest_expiry", None)
+    if nearest:
+        nearest_norm = str(nearest).strip().upper()
+        for row in snapshot.rows:
+            if int(round(row.strike)) == target_strike and str(row.expiry).strip().upper() == nearest_norm:
+                ltp = row.ce_ltp if direction == "LONG" else row.pe_ltp
+                if ltp is not None and ltp > 0:
+                    return ltp
+
+    # 3. Fallback: match strike on the nearest available row with non-zero LTP
     for row in snapshot.rows:
-        if row.strike == strike and row.expiry == want:
-            return row.ce_ltp if direction == "LONG" else row.pe_ltp
+        if int(round(row.strike)) == target_strike:
+            ltp = row.ce_ltp if direction == "LONG" else row.pe_ltp
+            if ltp is not None and ltp > 0:
+                return ltp
+
     return None
 
 
@@ -237,6 +264,7 @@ class DaySession:
         self.holiday_dates = holidays or set()
         self.data_source = data_source
         self.live_mode = live_mode
+        self.telegram_trades_only = live_mode or getattr(settings, "TELEGRAM_TRADES_ONLY", False)
         self.legacy_execution_enabled = not live_mode
         self.entry = EntryEngine(market.journal)
         self.exit_engine = ExitEngine(market.journal)
@@ -291,7 +319,10 @@ class DaySession:
         from engines.shadow_compliant import ShadowCompliantLedger
         self.shadow_compliant_ledger = ShadowCompliantLedger()
 
-        # Active Model A: Unified Liquidity & Fibonacci Sniper System
+        # Phase 14 Engine Census Enforcement (One Brain Consolidation)
+        from engines.census import print_and_export_census
+        print_and_export_census()
+
         from engines.shadow_mw import ShadowMWEngine, UnifiedLiquiditySniper, dispatch_telegram_alert
         self.shadow_mw = ShadowMWEngine(store=self.store, today_iso=self.today_iso)
         self.sniper = UnifiedLiquiditySniper(
@@ -301,6 +332,10 @@ class DaySession:
             pdl=self.market.pdl,
             notifier=dispatch_telegram_alert,
         )
+
+        # Phase 15: Zone-Ride Model Engine (The Consolidated Final Spec)
+        from engines.zone_ride import ZoneRideEngine
+        self.zone_ride = ZoneRideEngine(notifier=self._notify)
 
         # Phase 1-10 Unified Architectural Engines
         self.snapshot_builder = MarketSnapshotBuilder()
@@ -340,6 +375,33 @@ class DaySession:
             if any(k in text for k in ("REGIME CHANGE", "DAY STATE", "TREND-UP", "TREND-DOWN", "VIX SPIKE")):
                 log.warning("Suppressed regime/state notification while candle engine is blind: %.80s",
                             text.replace("\n", " | "))
+                return
+
+        # Strict Trades-Only Telegram Filter:
+        # In live mode (or when TELEGRAM_TRADES_ONLY is active), strictly suppress non-trade informational noise
+        # (Level watches, coils, preflight, regime, skipped, etc.) to keep Telegram focused 100% on trade entries and exits.
+        trades_only = getattr(self, "telegram_trades_only", False) or getattr(settings, "TELEGRAM_TRADES_ONLY", False) or self.live_mode
+        if trades_only:
+            is_trade_msg = (
+                event_type in ("TRADE_ENTRY", "TRADE_UPDATE", "TRADE_EXIT")
+                or any(marker in text for marker in (
+                    "OPTION TRADE ENTRY",
+                    "OPTION TRADE CLOSED",
+                    "TARGET 1 HIT",
+                    "TRADE SIGNAL",
+                    "TRADE EXIT",
+                    "TRADE UPDATE",
+                    "TRADE CARD",
+                    "SIGNAL #",
+                    "EXIT #",
+                    "DATA-OUTAGE-EXIT",
+                    "CRITICAL SYSTEM HALT",
+                    "SHUTDOWN",
+                ))
+            )
+            if not is_trade_msg:
+                log.info("telegram suppressed non-trade message (trades-only): %.80s",
+                         text.replace("\n", " | "))
                 return
 
         if hasattr(self.tg, "send_event"):
@@ -603,7 +665,7 @@ class DaySession:
                 if (self._last_blind_alert_time is None or
                         (now - self._last_blind_alert_time).total_seconds() >= 900):
                     self._last_blind_alert_time = now
-                    self.tg.send(
+                    self._notify(
                         f"⚠️ CANDLE ENGINE BLIND\n"
                         f"Latest 5m candle: {age_txt} (> 5 min threshold).\n"
                         f"Feed blindness duration: {blind_duration_min:.1f} min.\n"
@@ -688,31 +750,49 @@ class DaySession:
 
         fresh = status.get("fresh_candles") or []
         if fresh:
-            # Update Active Model A Sniper & Shadow Arm on closed candles
-            for c in fresh:
-                self.shadow_mw.on_candle(c, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
-                if hasattr(self, "sniper"):
-                    self.sniper.on_candle(c, day_state=self.day_state, chain=getattr(self.market, "chain", None))
+            # Sync market trade_expiry to chain snapshot if available
+            if getattr(self.market, "trade_expiry", None) and hasattr(self.market, "chain") and self.market.chain:
+                setattr(self.market.chain, "trade_expiry", self.market.trade_expiry)
+
+            # Ensure sniper and shadow_mw levels are initialized as soon as PDH/PDL are locked
+            if getattr(self.market, "pdh", None) and getattr(self.market, "pdl", None):
+                if hasattr(self, "sniper") and hasattr(self.sniper, "initialize_levels"):
+                    if not getattr(self.sniper.arm1, "levels_initialized", False) or not self.sniper.arm1.levels:
+                        self.sniper.initialize_levels(pdh=self.market.pdh, pdl=self.market.pdl)
+                if hasattr(self, "shadow_mw") and hasattr(self.shadow_mw, "initialize_levels"):
+                    if not getattr(self.shadow_mw, "levels_initialized", False) or not self.shadow_mw.levels:
+                        self.shadow_mw.initialize_levels(self.market, today_iso=self.today_iso)
 
             if self.first_cycle:
-                # Backlog is NEVER a signal candidate (hotfix: Signal #2 fired 85
-                # min after its candle from a processed backlog).
-                log.info("STALE backlog discarded: %d candle(s) at startup - never "
-                         "signal candidates", len(fresh))
+                # Startup catch-up backlog: sync internal state silently without spamming alerts
+                for c in fresh:
+                    self.shadow_mw.on_candle(c, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
+                    if hasattr(self, "sniper"):
+                        self.sniper.on_candle(c, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=False)
+                log.info("STALE backlog processed silently: %d candle(s) at startup (alerts suppressed)", len(fresh))
                 self.store.journal_event(
                     "SKIP", notes=f"backlog discarded: {len(fresh)} stale candle(s) "
                                   f"at startup (never signal candidates)")
             else:
+                # Process any superseded older candles silently
                 for stale in fresh[:-1]:
-                    log.info("STALE discarded (superseded by a newer candle): %s",
-                             stale.start.isoformat(timespec="seconds"))
-                candidate = fresh[-1]                # ONLY the latest closed candle
+                    self.shadow_mw.on_candle(stale, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
+                    if hasattr(self, "sniper"):
+                        self.sniper.on_candle(stale, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=False)
+                    log.info("STALE superseded candle processed silently: %s", stale.start.isoformat(timespec="seconds"))
+
+                # ONLY the latest closed candle
+                candidate = fresh[-1]
                 age = (ist_now() - candidate.end).total_seconds()
-                if age > settings.STALE_CANDLE_MAX_AGE_SEC:
-                    log.warning("STALE discarded: candle %s closed %.0f s ago "
-                                "(> %d s) - never fired",
-                                candidate.start.isoformat(timespec="seconds"),
-                                age, settings.STALE_CANDLE_MAX_AGE_SEC)
+                is_fresh = (age <= settings.STALE_CANDLE_MAX_AGE_SEC)
+
+                self.shadow_mw.on_candle(candidate, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
+                if hasattr(self, "sniper"):
+                    self.sniper.on_candle(candidate, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=is_fresh)
+
+                if not is_fresh:
+                    log.warning("STALE discarded: candle %s closed %.0f s ago (> %d s) - alerts suppressed",
+                                candidate.start.isoformat(timespec="seconds"), age, settings.STALE_CANDLE_MAX_AGE_SEC)
                 else:
                     self.process_candle_close(candidate)
         self.first_cycle = False
@@ -757,6 +837,87 @@ class DaySession:
 
             # 4. Open trades
             open_list = []
+            if hasattr(self, "zone_ride") and self.zone_ride.active_trade:
+                zt = self.zone_ride.active_trade
+                open_list.append({
+                    "trade_id": zt.trade_id,
+                    "family": "ZONE-RIDE",
+                    "direction": zt.direction,
+                    "strike": zt.strike,
+                    "entry_spot": float(zt.entry_spot),
+                    "spot": float(zt.entry_spot),
+                    "entry_prem": float(zt.entry_prem),
+                    "option_ltp": float(zt.entry_prem),
+                    "sl_spot": float(zt.current_sl_spot),
+                    "current_prem": float(zt.entry_prem),
+                    "entry_time": zt.entry_time,
+                    "time": zt.entry_time[11:16] if len(zt.entry_time) >= 16 else "—",
+                    "setup": "Phase 15 Zone-Ride Model",
+                    "option_symbol": zt.option_symbol,
+                    "status": zt.status,
+                    "opposing_wall_booked": zt.opposing_wall_booked,
+                })
+            if hasattr(self, "sniper"):
+                for st_trade in self.sniper.arm1.trades:
+                    if st_trade.status in ("OPEN", "PARTIAL_TGT1"):
+                        open_list.append({
+                            "trade_id": st_trade.trade_id,
+                            "family": "M/W-SWEEP",
+                            "direction": st_trade.direction,
+                            "strike": st_trade.strike,
+                            "entry_spot": float(st_trade.entry_price),
+                            "spot": float(st_trade.entry_price),
+                            "entry_prem": float(st_trade.entry_prem),
+                            "option_ltp": float(st_trade.entry_prem),
+                            "sl_spot": float(st_trade.current_sl),
+                            "current_prem": float(st_trade.entry_prem),
+                            "entry_time": st_trade.entry_time,
+                            "time": st_trade.entry_time[11:16] if len(st_trade.entry_time) >= 16 else "—",
+                            "setup": getattr(st_trade, "setup_name", f"{st_trade.pattern} Liquidity Sweep ({st_trade.level_name})"),
+                            "option_symbol": st_trade.option_symbol,
+                            "status": st_trade.status,
+                            "half_booked": st_trade.half_booked,
+                        })
+                if getattr(self.sniper.arm2, "active_trade", None):
+                    at = self.sniper.arm2.active_trade
+                    open_list.append({
+                        "trade_id": at.trade_id,
+                        "family": "TL-FIB",
+                        "direction": at.direction,
+                        "strike": at.strike,
+                        "entry_spot": float(at.entry_price),
+                        "spot": float(at.entry_price),
+                        "entry_prem": float(at.entry_prem),
+                        "option_ltp": float(at.entry_prem),
+                        "sl_spot": float(at.current_sl),
+                        "current_prem": float(at.entry_prem),
+                        "entry_time": at.entry_time,
+                        "time": at.entry_time[11:16] if len(at.entry_time) >= 16 else "—",
+                        "setup": at.setup_name,
+                        "option_symbol": at.option_symbol,
+                        "status": at.status,
+                        "half_booked": at.half_booked,
+                    })
+                if getattr(self.sniper, "arm3", None) and getattr(self.sniper.arm3, "active_trade", None):
+                    zr = self.sniper.arm3.active_trade
+                    open_list.append({
+                        "trade_id": zr.trade_id,
+                        "family": "ZONE-REVERSAL",
+                        "direction": zr.direction,
+                        "strike": zr.strike,
+                        "entry_spot": float(zr.entry_price),
+                        "spot": float(zr.entry_price),
+                        "entry_prem": float(zr.entry_prem),
+                        "option_ltp": float(zr.entry_prem),
+                        "sl_spot": float(zr.current_sl),
+                        "current_prem": float(zr.entry_prem),
+                        "entry_time": zr.entry_time,
+                        "time": zr.entry_time[11:16] if len(zr.entry_time) >= 16 else "—",
+                        "setup": zr.setup_name,
+                        "option_symbol": zr.option_symbol,
+                        "status": zr.status,
+                        "notes": zr.notes,
+                    })
             for t in self.book.trades:
                 entry_dt_str = t.entry_time.isoformat() if hasattr(t, "entry_time") and t.entry_time else None
                 entry_time_str = t.entry_time.strftime("%H:%M") if hasattr(t, "entry_time") and t.entry_time else "—"
@@ -837,6 +998,13 @@ class DaySession:
                 "shadow_compliant": self.shadow_compliant_ledger.get_eod_summary(today_iso),
                 "shadow_mw": self.shadow_mw.get_summary(today_iso),
                 "sniper": self.sniper.get_summary() if hasattr(self, "sniper") else None,
+                "sniper_trades": self.sniper.get_all_trades_dict() if hasattr(self, "sniper") else [],
+                "zone_ride": {
+                    "active_trade": asdict(self.zone_ride.active_trade) if getattr(self, "zone_ride", None) and self.zone_ride.active_trade else None,
+                    "support_zones": [asdict(z) for z in self.zone_ride.support_zones] if getattr(self, "zone_ride", None) else [],
+                    "resistance_zones": [asdict(z) for z in self.zone_ride.resistance_zones] if getattr(self, "zone_ride", None) else [],
+                    "closed_count": len(self.zone_ride.closed_trades) if getattr(self, "zone_ride", None) else 0,
+                },
             }
 
             state_path = settings.DATA_DIR / "state.json"
@@ -1013,6 +1181,210 @@ class DaySession:
             candle.high, candle.low, candle.close, candle.start.isoformat()
         )
         self._process_unified_strategies(candle)
+        self._process_zone_ride(candle)
+
+    def _process_zone_ride(self, candle) -> None:
+        """Phase 15 Zone-Ride Model Execution & Position Management Pipeline.
+
+        1. Recompute STRONG Liquidity Zones from live chain & candle structure.
+        2. If active trade open:
+           - Update 5-min structure trail (higher lows for LONG, lower highs for SHORT).
+           - Optional single 30% booking ONLY at major opposing wall.
+           - Square-off check (15:10 IST normal, 15:25 on trend days).
+           - Close on structure trail break.
+        3. If no active trade open:
+           - Check patience gate & confirmation gates (Candle 1 close off zone + Candle 2 breaks edge with body >= 50%).
+           - Check OI velocity gate (covering = fuel, stacking = block).
+           - Check delta 0.65-0.75 ITM instrument selection & capital gate.
+           - Check premium room gate (opposing zone >= 20 premium pts).
+           - Check NO_SILENT_TRADES hard gate (card must deliver to Telegram first).
+        """
+        if not hasattr(self, "zone_ride"):
+            return
+
+        now = ist_now()
+        spot = self.market.spot_value() or candle.close
+
+        # 1. Update zones
+        self.zone_ride.update_zones(
+            chain_snapshot=self.market.chain,
+            spot=spot,
+            candles=self.market.candles,
+            pdh=self.market.pdh,
+            pdl=self.market.pdl,
+            pdc=self.market.pdc,
+        )
+
+        is_trend_day = bool(
+            self.regime and self.regime.regime.value in ("TREND-UP", "TREND-DOWN")
+        )
+
+        # 2. Position Management for active Zone-Ride trade
+        if self.zone_ride.active_trade and self.zone_ride.active_trade.status != "CLOSED":
+            act, reason = self.zone_ride.update_position(
+                candle=candle,
+                spot=spot,
+                current_time=now,
+                is_trend_day=is_trend_day,
+            )
+            tr = self.zone_ride.active_trade or (self.zone_ride.closed_trades[-1] if self.zone_ride.closed_trades else None)
+            if act == "WALL_BOOKING" and tr:
+                wall_alert = messages.format_zone_ride_wall_booking_alert(
+                    trade_id=tr.trade_id,
+                    direction=tr.direction,
+                    option_symbol=tr.option_symbol,
+                    entry_prem=tr.entry_prem,
+                    wall_prem=round(tr.entry_prem + tr.prem_room, 1),
+                    entry_spot=tr.entry_spot,
+                    current_spot=candle.close,
+                    opposing_wall_name=tr.opposing_zone.zone_id if tr.opposing_zone else "Wall",
+                )
+                self._notify(wall_alert, event_type="WALL_BOOKING", event_id=tr.trade_id)
+                self.store.journal_event(
+                    "PARTIAL_BOOKING",
+                    spot=candle.close,
+                    trade_id=tr.trade_id,
+                    notes=f"Zone-Ride 30% booked at opposing wall {tr.opposing_zone.zone_id if tr.opposing_zone else 'Wall'}",
+                )
+            elif act == "EXIT" and tr:
+                exit_alert = messages.format_zone_ride_exit_alert(
+                    trade_id=tr.trade_id,
+                    direction=tr.direction,
+                    option_symbol=tr.option_symbol,
+                    entry_prem=tr.entry_prem,
+                    exit_prem=tr.exit_prem or tr.entry_prem,
+                    entry_spot=tr.entry_spot,
+                    exit_spot=tr.exit_spot or candle.close,
+                    realized_r=tr.realized_r,
+                    exit_reason=tr.exit_reason or reason or "EXIT",
+                    notes=tr.notes,
+                )
+                self._notify(exit_alert, event_type="TRADE_EXIT", event_id=tr.trade_id)
+                self.store.journal_event(
+                    "EXIT",
+                    spot=tr.exit_spot or candle.close,
+                    trade_id=tr.trade_id,
+                    direction=tr.direction,
+                    strike=tr.strike,
+                    result_r=tr.realized_r,
+                    exit_reason=tr.exit_reason or reason,
+                    notes=f"Zone-Ride exit: {tr.exit_reason} ({tr.realized_r:+.2f}R)",
+                )
+                log.info("Zone-Ride trade %s EXITED: %.2fR (%s)", tr.trade_id, tr.realized_r, tr.exit_reason)
+            return
+
+        # 3. New Entry Evaluation (Patience Gate)
+        t_now = now.time()
+        if not (settings.ENTRY_EVAL_START <= t_now <= settings.LAST_ENTRY_TIME):
+            return
+
+        trend_val = "NORMAL"
+        if self.day_state and self.day_state.state:
+            trend_val = self.day_state.state
+        elif self.regime and self.regime.regime.value:
+            trend_val = self.regime.regime.value
+
+        from engines.census import is_engine_approved
+        if not is_engine_approved("ENG-07-ZONERIDE"):
+            return
+
+        sig = self.zone_ride.evaluate_entry(
+            candles=self.market.candles,
+            chain_snapshot=self.market.chain,
+            spot=spot,
+            trend=trend_val,
+            capital=getattr(settings, "CAPITAL", 100000.0),
+            vix_val=vix_val,
+            expiry=self.market.trade_expiry or "",
+        )
+
+        if sig is not None:
+            self.fire_zone_ride(sig, is_trend_day=is_trend_day)
+
+    def fire_zone_ride(self, sig, is_trend_day: bool = False) -> None:
+        """Executes Phase 15 Zone-Ride trade with NO_SILENT_TRADES hard gate."""
+        card_text = messages.format_zone_ride_entry_alert(
+            trade_id=sig.trade_id,
+            direction=sig.direction,
+            anchor_zone_name=sig.anchor_zone.zone_type,
+            anchor_zone_range=f"{sig.anchor_zone.zone_low:.1f} – {sig.anchor_zone.zone_high:.1f}",
+            entry_spot=sig.entry_spot,
+            initial_sl_spot=sig.sl_spot,
+            risk_pts=sig.risk_spot_pts,
+            opposing_zone_name=sig.opposing_zone.zone_id if sig.opposing_zone else "Open Air / Resistance Wall",
+            room_spot_pts=sig.room_to_opposing_spot_pts,
+            room_prem_pts=sig.prem_room,
+            spot_target=sig.spot_target,
+            prem_target=sig.prem_target,
+            strike=sig.strike,
+            option_type=sig.option_type,
+            option_symbol=sig.option_symbol,
+            entry_prem=sig.entry_prem,
+            sl_prem=sig.sl_prem,
+            expiry=sig.expiry,
+            delta=sig.delta,
+            confluence_factors=sig.anchor_zone.confluence_factors,
+            is_trend_day=is_trend_day,
+        )
+
+        # Phase 14 / 15: NO SILENT TRADES HARD GATE
+        announced = self._notify(card_text, event_type="TRADE_ENTRY", event_id=sig.trade_id)
+        if announced is False and getattr(self.tg, "configured", False) and getattr(self, "live_mode", False):
+            self.store.journal_event(
+                "SKIP",
+                direction=sig.direction,
+                strike=sig.strike,
+                spot=sig.entry_spot,
+                score=90,
+                family="ZONE-RIDE",
+                notes=f"BLOCKED (NO_SILENT_TRADES): Entry card failed delivery for {sig.trade_id}",
+            )
+            log.error("ZONE-RIDE BLOCKED (NO_SILENT_TRADES): %s failed announcement!", sig.trade_id)
+            return
+
+        # Open the active trade in the engine
+        trade = self.zone_ride.open_position(sig)
+
+        reasons_payload = {
+            "trade_id": sig.trade_id,
+            "direction": sig.direction,
+            "entry_price": sig.entry_spot,
+            "initial_sl": sig.sl_spot,
+            "current_sl": sig.sl_spot,
+            "risk_pts": sig.risk_spot_pts,
+            "strike": sig.strike,
+            "option_type": sig.option_type,
+            "option_symbol": sig.option_symbol,
+            "expiry": sig.expiry,
+            "delta": sig.delta,
+            "entry_prem": sig.entry_prem,
+            "sl_prem": sig.sl_prem,
+            "prem_room": sig.prem_room,
+            "room_to_opposing_spot_pts": sig.room_to_opposing_spot_pts,
+            "spot_target": sig.spot_target,
+            "prem_target": sig.prem_target,
+            "anchor_zone": sig.anchor_zone.zone_id,
+            "opposing_zone": sig.opposing_zone.zone_id if sig.opposing_zone else "None",
+            "entry_time": sig.timestamp,
+            "status": "OPEN",
+            "setup_name": "Phase 15 Zone-Ride Model",
+            "notes": f"Bounce off {sig.anchor_zone.zone_id} [{sig.anchor_zone.zone_low:.0f}–{sig.anchor_zone.zone_high:.0f}]",
+        }
+
+        self.store.journal_event(
+            "SIGNAL",
+            direction=sig.direction,
+            strike=sig.strike,
+            spot=sig.entry_spot,
+            option_ltp=sig.entry_prem,
+            score=90,
+            reasons=reasons_payload,
+            trade_id=sig.trade_id,
+            family="ZONE-RIDE",
+            notes=f"[ZONE-RIDE] {sig.trade_id} SIGNAL | {sig.direction} {sig.option_symbol} @ ₹{sig.entry_prem:.1f}",
+        )
+        log.info("ZONE-RIDE SIGNAL FIRED: %s %s @ ₹%.1f prem (Delta %.2f), Spot %.1f, SL %.1f",
+                 sig.trade_id, sig.option_symbol, sig.entry_prem, sig.delta, sig.entry_spot, sig.sl_spot)
 
     def _process_unified_strategies(self, candle) -> None:
         """Evaluates Consolidated S1/S2/S3 strategies through Arbiter, RiskGovernor,
@@ -1706,19 +2078,56 @@ class DaySession:
         if not gate_ok:
             return self._suppress(ev, family, sg_reason)
 
-        strike = round_to_strike(spot)
-        if abs(strike - spot) > spot * settings.ATM_BAND_PCT:
+        # ATM sanity check & LTP plausibility
+        atm_strike = round_to_strike(spot)
+        if abs(atm_strike - spot) > spot * settings.ATM_BAND_PCT:
             return self._suppress(ev, family,
-                                  f"ATM strike {strike} not within "
+                                  f"ATM strike {atm_strike} not within "
                                   f"{settings.ATM_BAND_PCT:.0%} of spot {spot:.2f}",
                                   alert=True)
-        ltp = option_ltp_for(snapshot, strike, ev.direction,
-                             expiry=self.market.trade_expiry)
-        if not ltp_is_plausible(ltp, spot):
+        atm_ltp = option_ltp_for(snapshot, atm_strike, ev.direction,
+                                 expiry=self.market.trade_expiry)
+        if atm_ltp is not None and not ltp_is_plausible(atm_ltp, spot):
+            return self._suppress(ev, family,
+                                  f"option LTP implausible ({atm_ltp}) for {atm_strike} "
+                                  f"{self.market.trade_expiry} at spot {spot:.2f}",
+                                  alert=True)
+
+        # Phase 14: Delta-Aware Strike Selection (Target Delta 0.65 - 0.75 ITM)
+        from engines.delta_execution import select_delta_aware_strike, evaluate_delta_geometry_gate
+        vix_val = getattr(self.market.vix, "value", {}).get("value", 14.5) if hasattr(self.market, "vix") else 14.5
+        strike_info = select_delta_aware_strike(
+            spot=spot,
+            direction=ev.direction,
+            chain_snapshot=snapshot,
+            vix_value=vix_val,
+            expiry=self.market.trade_expiry or "",
+        )
+        strike = strike_info["strike"]
+        delta_val = strike_info["delta"]
+        ltp = strike_info["entry_prem"]
+
+        if ltp is not None and not ltp_is_plausible(ltp, spot):
             return self._suppress(ev, family,
                                   f"option LTP implausible ({ltp}) for {strike} "
                                   f"{self.market.trade_expiry} at spot {spot:.2f}",
                                   alert=True)
+
+        # Phase 14: Geometry Gate (TGT1 >= 15 premium pts) & Capital Cap (<= 70% account)
+        spot_risk_dist = abs(spot - sl_spot)
+        geo_res = evaluate_delta_geometry_gate(
+            entry_prem=ltp,
+            spot_entry=spot,
+            spot_sl=sl_spot,
+            spot_tgt1=spot + spot_risk_dist if ev.direction == "LONG" else spot - spot_risk_dist,
+            spot_tgt2=spot + 2 * spot_risk_dist if ev.direction == "LONG" else spot - 2 * spot_risk_dist,
+            delta=delta_val,
+            capital=getattr(settings, "CAPITAL", 100000.0),
+            lot_size=getattr(settings, "LOT_SIZE", 75),
+        )
+        if not geo_res["passed"]:
+            return self._suppress(ev, family, " | ".join(geo_res["reasons"]))
+
         if self.market.trade_expiry is None:
             return self._suppress(ev, family, "no tradeable expiry available",
                                   alert=True)
@@ -1735,6 +2144,31 @@ class DaySession:
         trade.capture_original_plan()     # post-exit shadow tracks this plan
         trade.runway_pts = runway
         trade.runway_wall = wall_label
+        trade.delta = delta_val
+        trade.spot_r = geo_res["spot_r"]
+        trade.prem_r = geo_res["prem_r"]
+
+        # Phase 14: NO SILENT TRADES HARD GATE
+        # The entry card MUST be announced to Telegram BEFORE opening/recording trade.
+        card_text = messages.trade_card(
+            signal_no=signal_no, direction=ev.direction, trade=trade,
+            spot=trade.entry_spot, now_txt=ist_now().strftime("%H:%M:%S"),
+            family=family,
+            data_source=f"{self.data_source} | {self.market.data_footer()}",
+            delta=delta_val,
+            spot_r=geo_res["spot_r"],
+            prem_r=geo_res["prem_r"],
+        )
+        announced = self._notify(card_text, event_type="TRADE_ENTRY", event_id=trade.trade_id)
+        if announced is False and getattr(self.tg, "configured", False) and getattr(self, "live_mode", False):
+            self.store.journal_event(
+                "SKIP", direction=trade.direction, strike=trade.strike,
+                spot=trade.entry_spot, score=trade.score, family=family,
+                notes=f"BLOCKED (NO_SILENT_TRADES): Entry card failed delivery for {trade.trade_id}")
+            log.error("TRADE BLOCKED (NO_SILENT_TRADES): %s failed announcement!", trade.trade_id)
+            return None
+
+        trade.entry_announced = True
         if reentry_fired:
             self.reentry_available[ev.direction] = False   # grant consumed
         sig_notes = f"signal candle {family} {ev.direction} {ev.candle.start.isoformat(timespec='seconds')}"
@@ -1747,14 +2181,9 @@ class DaySession:
             day_state=self.day_state.state if self.day_state else None,
             notes=sig_notes, risk_units=trade.risk_units)
         self.book.add(trade)
-        self._notify(messages.trade_card(
-            signal_no=signal_no, direction=ev.direction, trade=trade,
-            spot=trade.entry_spot, now_txt=ist_now().strftime("%H:%M:%S"),
-            family=family,
-            data_source=f"{self.data_source} | {self.market.data_footer()}"))
-        log.info("SIGNAL %s [%s]: %s @ %.2f prem, score %d, SL %.2f, expiry %s | %s",
+        log.info("SIGNAL %s [%s]: %s @ %.2f prem (Delta %.2f), score %d, SL %.2f, expiry %s | %s",
                  trade.trade_id, family, trade.option, trade.entry_prem,
-                 trade.score, trade.sl_spot, trade.expiry, self.market.data_footer())
+                 trade.delta, trade.score, trade.sl_spot, trade.expiry, self.market.data_footer())
         # consume a WALL-UNWINDING re-entry grant when it was spent
         if self.book.direction_count(trade.direction) >= settings.MAX_TRADES_PER_DIRECTION:
             self.reentry_available[trade.direction] = False

@@ -51,9 +51,10 @@ def signal(*, direction: str, option: str, score, entry_spot, sl_level, reasons)
 
 def trade_card(*, signal_no: int, direction: str, trade, spot: float,
                now_txt: str, family: str = "BREAKOUT",
-               data_source: str = "live-chain") -> str:
-    """🎯 full trade card, exact format per spec (Prompt B module 3, tagged with the
-    setup family per Prompt B+ #5, runway per Trend-Day v2.1)."""
+               data_source: str = "live-chain",
+               delta: float = 0.0, spot_r: float = 0.0,
+               prem_r: float = 0.0) -> str:
+    """🎯 full trade card, exact format per spec with Phase 14 Delta-Aware metrics."""
     side = "CE" if direction == "LONG" else "PE"
     action = "BUY"
     reasons = []
@@ -68,22 +69,35 @@ def trade_card(*, signal_no: int, direction: str, trade, spot: float,
         runway_line = f"RUNWAY: {trade.runway_pts:.0f} pts to wall {trade.runway_wall}"
     else:
         runway_line = "RUNWAY: n/a (no measurable wall)"
+
+    delta_beta = delta if delta > 0 else settings.PREMIUM_BETA
+    delta_line = f"DELTA: {delta:.2f} (Target ITM 0.65-0.75)" if delta > 0 else ""
+    r_line = f"RISK/REWARD: Spot {spot_r:.2f}R | Premium {prem_r:.2f}R" if (spot_r > 0 or prem_r > 0) else ""
+
     lines = [
         f"🎯 SIGNAL #{signal_no} [{family}] — {action} {side} {trade.strike} "
         f"(weekly expiry {trade.expiry})",
         f"⏰ {now_txt} | candle close {candle_close} | "
         f"spot {spot:.2f} | score {trade.score}",
+    ]
+    if delta_line:
+        lines.append(delta_line)
+    if r_line:
+        lines.append(r_line)
+    lines += [
         "WHY:",
         *reasons,
         f"ENTRY: {action} {trade.strike} at ₹{trade.entry_prem:.2f}–₹{band_top:.2f} "
         f"(1 lot = {settings.LOT_SIZE} qty)",
         f"SL spot: {trade.sl_spot:.2f} — candle CLOSE beyond = EXIT",
-        f"SL prem: ₹{trade.entry_prem * settings.SL_PREMIUM_FRACTION:.2f}",
+        f"SL prem: ₹{max(5.0, trade.entry_prem - (abs(trade.entry_spot - trade.sl_spot) * delta_beta)):.2f}"
+        if delta > 0
+        else f"SL prem: ₹{trade.entry_prem * settings.SL_PREMIUM_FRACTION:.2f}",
         f"TGT 1: spot {trade.tgt1_spot:.2f} → prem ~"
-        f"₹{trade.entry_prem + settings.PREMIUM_BETA * trade.one_r:.2f} → "
+        f"₹{trade.entry_prem + delta_beta * trade.one_r:.2f} → "
         f"BOOK 50%, SL to entry",
         f"TGT 2: spot {trade.tgt2_spot:.2f} → prem ~"
-        f"₹{trade.entry_prem + settings.PREMIUM_BETA * 2 * trade.one_r:.2f} → "
+        f"₹{trade.entry_prem + delta_beta * 2 * trade.one_r:.2f} → "
         f"EXIT rest",
         f"MAX RISK: ₹{settings.RISK_PREM_FRACTION * trade.entry_prem * settings.LOT_SIZE:,.0f} "
         f"| Exit by 15:10",
@@ -471,6 +485,7 @@ def format_sniper_entry_alert(
     tgt2_price: float,
     fib_50: float = 0.0,
     fib_618: float = 0.0,
+    fib_705: float = 0.0,
     notes: str = "",
     strike: int = 0,
     option_type: str = "",
@@ -479,35 +494,67 @@ def format_sniper_entry_alert(
     sl_prem: float = 0.0,
     tgt1_prem: float = 0.0,
     tgt2_prem: float = 0.0,
+    expiry: str = "",
+    delta: float = 0.65,
+    spot_r: float = 0.0,
+    prem_r: float = 0.0,
+    confluence_bonus: bool = False,
+    ride_target_prem_pts: float = 0.0,
 ) -> str:
-    """🎯 Production Telegram alert for Model A Option Trade Entry."""
+    """🎯 Production Telegram alert for Option Trade Entry (Phase 15.1 TL-FIB v2)."""
     side_badge = "🟢 BUY CE (CALL)" if direction == "LONG" else "🔴 BUY PE (PUT)"
     opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else side_badge)
+    if expiry and expiry not in opt_name:
+        opt_name = f"{opt_name} ({expiry} Expiry)"
     lot_size = getattr(settings, "LOT_SIZE", 75)
     prem_txt = f"₹{entry_prem:.1f} – ₹{entry_prem + 10.0:.1f}" if entry_prem > 0 else "Market Order"
     sl_prem_txt = f"₹{sl_prem:.1f}" if sl_prem > 0 else "—"
     tgt1_prem_txt = f"₹{tgt1_prem:.1f}" if tgt1_prem > 0 else "—"
     tgt2_prem_txt = f"₹{tgt2_prem:.1f}" if tgt2_prem > 0 else "—"
     capital_txt = f"₹{entry_prem * lot_size:,.0f}" if entry_prem > 0 else "—"
-    fib_txt = f"Golden Pocket: [{min(fib_50, fib_618):.1f} – {max(fib_50, fib_618):.1f}]\n" if fib_50 > 0 else ""
+
+    fib_lo = min(fib_50, fib_618, fib_705) if fib_50 > 0 else 0.0
+    fib_hi = max(fib_50, fib_618, fib_705) if fib_50 > 0 else 0.0
+    bonus_str = " 🔥 [OI Zone Confluence +10]" if confluence_bonus else ""
+    fib_txt = f"• Golden Pocket: [{fib_lo:.1f} – {fib_hi:.1f}]{bonus_str}\n" if fib_50 > 0 else ""
+    delta_val = delta if delta > 0 else 0.65
+    delta_txt = f"• Strike Delta: {delta_val:.2f} (Slightly ITM)\n"
+
+    prem_gain = ride_target_prem_pts if ride_target_prem_pts > 0 else (tgt2_prem - entry_prem if (tgt2_prem and entry_prem) else 20.0)
+
+    is_sweep = "SMW" in trade_id or "Sweep" in setup_name
+    is_zone_reversal = trade_id.startswith("ZR-") or "Zone Reversal" in setup_name or "Trendline" in setup_name
+    if is_zone_reversal:
+        title = "ZONE REVERSAL"
+        rule_desc = "Arm 3: 2-Candle Liquidity Zone Reversal | PDH/PDL/OI Levels | Trendline Rejection | Structural Trail"
+    elif is_sweep:
+        title = "LIQUIDITY SWEEP"
+        rule_desc = "Arm 1 Institutional Liquidity Sweep | MSS Confirmed | Fib Targets"
+    else:
+        title = "TL-FIB v2"
+        rule_desc = "Phase 15.1 TL-FIB v2 | With-Trend Only | Scalp-Killer Active"
 
     return (
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 NIFTY SNIPER — OPTION TRADE ENTRY\n"
+        f"🎯 NIFTY SNIPER — {title} ENTRY\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"INSTRUMENT: {opt_name}\n"
         f"ACTION: {side_badge} at {prem_txt}\n"
         f"LOT SIZE: {lot_size} Qty (1 Lot) | Capital: ~{capital_txt}\n\n"
+        f"{delta_txt}"
         f"• Entry Spot: ₹{entry_price:.1f}\n"
         f"• Stop Loss: {sl_prem_txt} Prem (Spot ref: ₹{initial_sl:.1f} | Risk: {risk_pts:.1f} pts)\n"
-        f"• Target 1: {tgt1_prem_txt} Prem (Spot ref: ₹{tgt1_price:.1f})\n"
-        f"  ↳ BOOK 50% PROFIT, MOVE SL TO BREAKEVEN (BE_SL)\n"
-        f"• Target 2: {tgt2_prem_txt} Prem (Spot ref: ₹{tgt2_price:.1f})\n"
-        f"  ↳ RUNNER EXIT\n\n"
+        f"• Checkpoint (1st Pivot): {tgt1_prem_txt} Prem (Spot ref: ₹{tgt1_price:.1f})\n"
+        f"  ↳ CHECKPOINT ONLY — NEVER AUTO-EXIT (Structure Trailing Active)\n"
+        f"• Ride Target: +{prem_gain:.1f} prem pts (Spot ref: ₹{tgt2_price:.1f} | {tgt2_prem_txt} Prem)\n\n"
         f"{fib_txt}"
+        "THE RIDE RULES:\n"
+        "↳ Single trade — zero early scalps (1R auto-exit removed)\n"
+        "↳ Trailing 5-min structure from entry (Runner holds)\n"
+        "↳ 15:10 Square-Off\n\n"
         f"Setup: {setup_name}\n"
         f"Trade ID: {trade_id}\n"
-        f"Rule: Zero Counter-Trend Trades | Time Gate Active\n"
+        f"Rule: {rule_desc}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -525,25 +572,25 @@ def format_sniper_tgt1_alert(
     entry_prem: float = 0.0,
     tgt1_prem: float = 0.0,
     tgt2_prem: float = 0.0,
+    expiry: str = "",
 ) -> str:
-    """🎯 Production Telegram alert when Target 1 is hit (50% locked + BE_SL)."""
+    """🎯 Production Telegram alert when First Pivot Checkpoint is reached (checkpoint only)."""
     opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else ("CE LONG" if direction == "LONG" else "PE SHORT"))
-    lot_size = getattr(settings, "LOT_SIZE", 75)
+    if expiry and expiry not in opt_name:
+        opt_name = f"{opt_name} ({expiry} Expiry)"
     gain_pts = max(0.0, tgt1_prem - entry_prem) if (tgt1_prem and entry_prem) else 0.0
-    gain_rupees = gain_pts * lot_size
-    gain_txt = f" (+{gain_pts:.1f} pts | +₹{gain_rupees:,.0f}/lot)" if gain_pts > 0 else ""
 
     return (
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 TARGET 1 HIT — 50% PROFIT BOOKED\n"
+        "🎯 TL-FIB v2 — FIRST PIVOT CHECKPOINT REACHED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"INSTRUMENT: {opt_name} ({trade_id})\n"
-        f"Target 1 Hit at: ₹{tgt1_prem:.1f} Prem{gain_txt}\n"
+        f"Checkpoint Reached at: ₹{tgt1_prem:.1f} Prem (+{gain_pts:.1f} pts)\n"
         f"Spot Index: ₹{tgt1_price:.1f}\n\n"
-        f"✅ ACTION: Book 50% Quantity Now (+1.0R Locked)\n"
-        f"🛡️ STOP MOVED TO ENTRY: ₹{entry_prem:.1f} (Breakeven BE_SL)\n\n"
-        f"• Status: Risk completely eliminated! Worst-case exit = +0.50R net\n"
-        f"• Runner Target 2: ₹{tgt2_prem:.1f} Prem (Spot ref: ₹{tgt2_price:.1f})\n"
+        "ℹ️ STATUS: Checkpoint cleared! Do NOT exit.\n"
+        "↳ 5-min Higher Lows / Lower Highs structure trailing is ACTIVE.\n"
+        "↳ Full runner is holding for the complete trend ride.\n"
+        f"• Ride Target: ₹{tgt2_prem:.1f} Prem (Spot ref: ₹{tgt2_price:.1f})\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -562,9 +609,136 @@ def format_sniper_exit_alert(
     option_symbol: str = "",
     entry_prem: float = 0.0,
     exit_prem: float = 0.0,
+    expiry: str = "",
 ) -> str:
-    """🚨 Production Telegram alert for Model A Option Trade Exit."""
+    """🚨 Production Telegram alert for TL-FIB v2 Option Trade Exit."""
     opt_name = option_symbol or (f"NIFTY {strike} {option_type}" if strike else ("CE LONG" if direction == "LONG" else "PE SHORT"))
+    if expiry and expiry not in opt_name:
+        opt_name = f"{opt_name} ({expiry} Expiry)"
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    res_badge = f"✅ {realized_r:+.2f} R" if realized_r > 0 else (f"🛡️ BE {realized_r:+.2f} R" if realized_r == 0 else f"❌ {realized_r:+.2f} R")
+    pnl_pts = (exit_prem - entry_prem) if (exit_prem and entry_prem) else 0.0
+    pnl_rs = pnl_pts * lot_size
+    pnl_txt = f" ({pnl_pts:+.1f} prem pts | ₹{pnl_rs:+,.0f}/lot)" if pnl_pts != 0 else ""
+
+    is_sweep = "SMW" in trade_id or "Sweep" in notes
+    title = "LIQUIDITY SWEEP" if is_sweep else "TL-FIB v2"
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚨 NIFTY SNIPER — {title} TRADE CLOSED\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {opt_name} ({trade_id})\n"
+        f"Buy Premium: ₹{entry_prem:.1f} | Exit Premium: ₹{exit_prem:.1f}\n"
+        f"Spot Entry: ₹{entry_price:.1f} | Spot Exit: ₹{exit_price:.1f}\n\n"
+        f"OUTCOME: {res_badge}{pnl_txt}\n"
+        f"Exit Reason: {exit_reason}\n"
+        f"Notes: {notes or '5-min Structure Trail Exit'}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_zone_ride_entry_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    anchor_zone_name: str,
+    anchor_zone_range: str,
+    entry_spot: float,
+    initial_sl_spot: float,
+    risk_pts: float,
+    opposing_zone_name: str,
+    room_spot_pts: float,
+    room_prem_pts: float,
+    spot_target: float,
+    prem_target: float,
+    strike: int,
+    option_type: str,
+    option_symbol: str = "",
+    entry_prem: float = 0.0,
+    sl_prem: float = 0.0,
+    expiry: str = "",
+    delta: float = 0.70,
+    confluence_factors: list[str] | None = None,
+    is_trend_day: bool = False,
+) -> str:
+    """🎯 Production Telegram alert for Phase 15 Zone-Ride Trade Entry."""
+    side_badge = "🟢 BUY CE (CALL)" if direction == "LONG" else "🔴 BUY PE (PUT)"
+    opt_name = option_symbol or f"NIFTY {strike} {option_type}"
+    if expiry and expiry not in opt_name:
+        opt_name = f"{opt_name} ({expiry} Expiry)"
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    capital = entry_prem * lot_size
+    conf_txt = f" | Confluence: {', '.join(confluence_factors)}" if confluence_factors else ""
+    target_type = "Trend Day Measured Move (50-100+ pts)" if is_trend_day else "Structure Target (20-40 pts)"
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 NIFTY SNIPER — ZONE-RIDE TRADE ENTRY\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {opt_name}\n"
+        f"ACTION: {side_badge} at ₹{entry_prem:.1f} – ₹{entry_prem + 10.0:.1f}\n"
+        f"LOT SIZE: {lot_size} Qty (1 Lot) | Capital: ~₹{capital:,.0f}\n\n"
+        f"• Anchor Zone: {anchor_zone_name} [{anchor_zone_range}] STRONG (Tested Today{conf_txt})\n"
+        f"• Entry Spot: ₹{entry_spot:.1f} (Confirming Candle Close)\n"
+        f"• Target Delta: {delta:.2f} (ITM Strike)\n"
+        f"• Stop Loss: ₹{sl_prem:.1f} Prem (Spot ref: ₹{initial_sl_spot:.1f} | Risk: {risk_pts:.1f} pts beyond zone far edge)\n"
+        f"• Room to Next Zone: {room_spot_pts:.1f} spot pts → ~{room_prem_pts:.1f} premium pts (Passed >= 20.0 pts gate)\n"
+        f"• Structure Target: Spot ₹{spot_target:.1f} (+{abs(spot_target - entry_spot):.1f} pts) → Premium ~₹{prem_target:.1f} (+{abs(prem_target - entry_prem):.1f} pts) [{target_type}]\n\n"
+        "THE RIDE:\n"
+        "↳ Single trade — zero early scalps / no +5 pt bookings\n"
+        "↳ Trailing 5-min Higher Lows structure (Runner holds)\n"
+        f"↳ Optional single 30% booking ONLY at major opposing wall ({opposing_zone_name})\n\n"
+        f"Trade ID: {trade_id}\n"
+        f"Rule: Phase 15 Zone-Ride Model | With-Trend Only | {'Trend Day Ride to Close' if is_trend_day else '15:10 Square-Off'}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_zone_ride_wall_booking_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    option_symbol: str,
+    entry_prem: float,
+    wall_prem: float,
+    entry_spot: float,
+    current_spot: float,
+    opposing_wall_name: str,
+) -> str:
+    """🎯 Production Telegram alert when major opposing wall is reached (optional 30% booking)."""
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    pnl_pts = max(0.0, wall_prem - entry_prem)
+    pnl_rs = pnl_pts * lot_size * 0.30
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 MAJOR OPPOSING WALL REACHED — OPTIONAL 30% BOOKED\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"INSTRUMENT: {option_symbol} ({trade_id})\n"
+        f"Wall Encountered: {opposing_wall_name} (Spot ₹{current_spot:.1f})\n"
+        f"30% Booked at Premium: ₹{wall_prem:.1f} (+{pnl_pts:.1f} pts | ~₹{pnl_rs:+,.0f})\n\n"
+        "THE RIDE CONTINUES:\n"
+        "↳ 70% RUNNER HOLDING & RIDING 5-MIN STRUCTURE\n"
+        "↳ Stop Loss locked to Breakeven / Structural Higher Low\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_zone_ride_exit_alert(
+    *,
+    trade_id: str,
+    direction: str,
+    option_symbol: str,
+    entry_prem: float,
+    exit_prem: float,
+    entry_spot: float,
+    exit_spot: float,
+    realized_r: float,
+    exit_reason: str,
+    notes: str = "",
+) -> str:
+    """🚨 Production Telegram alert for Zone-Ride structural trailing exit."""
     lot_size = getattr(settings, "LOT_SIZE", 75)
     res_badge = f"✅ {realized_r:+.2f} R" if realized_r > 0 else (f"🛡️ BE {realized_r:+.2f} R" if realized_r == 0 else f"❌ {realized_r:+.2f} R")
     pnl_pts = (exit_prem - entry_prem) if (exit_prem and entry_prem) else 0.0
@@ -573,14 +747,14 @@ def format_sniper_exit_alert(
 
     return (
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🚨 NIFTY SNIPER — OPTION TRADE CLOSED\n"
+        "🚨 NIFTY SNIPER — ZONE-RIDE TRADE CLOSED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"INSTRUMENT: {opt_name} ({trade_id})\n"
+        f"INSTRUMENT: {option_symbol} ({trade_id})\n"
         f"Buy Premium: ₹{entry_prem:.1f} | Exit Premium: ₹{exit_prem:.1f}\n"
-        f"Spot Entry: ₹{entry_price:.1f} | Spot Exit: ₹{exit_price:.1f}\n\n"
+        f"Spot Entry: ₹{entry_spot:.1f} | Spot Exit: ₹{exit_spot:.1f}\n\n"
         f"OUTCOME: {res_badge}{pnl_txt}\n"
         f"Exit Reason: {exit_reason}\n"
-        f"Notes: {notes or '—'}\n"
+        f"Notes: {notes or '5-min Structure Trail Exit'}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 

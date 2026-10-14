@@ -129,11 +129,17 @@ class ShadowMWTrade:
     strike: int = 0
     option_type: str = ""       # "CE" or "PE"
     option_symbol: str = ""     # e.g. "NIFTY 22550 CE"
+    expiry: str = ""            # e.g. "15-OCT-2026"
     entry_prem: float = 0.0     # Option Buy Price / LTP
     sl_prem: float = 0.0        # Option Stop Loss Premium
     tgt1_prem: float = 0.0      # Option Target 1 Premium
     tgt2_prem: float = 0.0      # Option Target 2 Premium
     exit_prem: float | None = None
+    setup_name: str = ""
+
+    def __post_init__(self):
+        if not self.setup_name and self.pattern and self.level_name:
+            self.setup_name = f"{self.pattern} Liquidity Sweep ({self.level_name})"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -781,6 +787,11 @@ class ShadowMWEngine:
         day_state: Any,
     ) -> None:
         """Create and track shadow trade without EMA or VWAP gates (The Experiment)."""
+        if getattr(self, "blocked", False):
+            return
+        if any(t.status in ("OPEN", "PARTIAL_TGT1") for t in self.trades):
+            return
+
         entry_price = candle.close
         trade_num = len(self.trades) + 1
         trade_id = f"SMW-{trade_num:03d}"
@@ -863,10 +874,12 @@ class ShadowMWEngine:
             strike=opt_leg["strike"],
             option_type=opt_leg["option_type"],
             option_symbol=opt_leg["option_symbol"],
+            expiry=opt_leg.get("expiry", ""),
             entry_prem=opt_leg["entry_prem"],
             sl_prem=opt_leg["sl_prem"],
             tgt1_prem=opt_leg["tgt1_prem"],
             tgt2_prem=opt_leg["tgt2_prem"],
+            setup_name=f"{candidate.pattern} Liquidity Sweep ({candidate.level_name})",
         )
         self.trades.append(trade)
         self._journal_event("SHADOW_ENTRY", trade)
@@ -1064,29 +1077,40 @@ class LiquidityTrendlineTrade:
     initial_sl: float
     current_sl: float
     risk_pts: float
-    tgt1_price: float           # Previous High / Low
-    tgt2_price: float           # -0.618 Fib Extension
+    tgt1_price: float           # Previous High / Low (Checkpoint Only)
+    tgt2_price: float           # 1.272xH Fib Extension (Ride Target)
     entry_time: str
     fib_50: float = 0.0
     fib_618: float = 0.0
     fib_705: float = 0.0
-    status: str = "OPEN"        # "OPEN", "PARTIAL_TGT1", "CLOSED"
+    status: str = "OPEN"        # "OPEN", "CHECKPOINT_HIT", "WALL_PARTIAL", "CLOSED"
     exit_price: float | None = None
     exit_time: str | None = None
     exit_reason: str | None = None
     realized_r: float = 0.0
     half_booked: bool = False
+    checkpoint_hit: bool = False
+    wall_booked: bool = False
+    booked_fraction: float = 0.0
     setup_name: str = ""
     notes: str = ""
     # Option Chain Execution Fields
     strike: int = 0
     option_type: str = ""       # "CE" or "PE"
     option_symbol: str = ""     # e.g. "NIFTY 22550 CE"
+    expiry: str = ""            # e.g. "15-OCT-2026"
     entry_prem: float = 0.0     # Option Buy Price / LTP
     sl_prem: float = 0.0        # Option Stop Loss Premium
-    tgt1_prem: float = 0.0      # Option Target 1 Premium
-    tgt2_prem: float = 0.0      # Option Target 2 Premium
+    tgt1_prem: float = 0.0      # Checkpoint Premium
+    tgt2_prem: float = 0.0      # Ride Target Premium
     exit_prem: float | None = None
+    delta: float = 0.65
+    ride_target_prem_pts: float = 0.0
+    confluence_bonus: int = 0
+    last_higher_low: float | None = None
+    last_lower_high: float | None = None
+    highest_spot: float = 0.0
+    lowest_spot: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1099,43 +1123,69 @@ def compute_option_leg(
     tgt1_price: float,
     tgt2_price: float,
     chain_snapshot: Any = None,
+    expiry: str | None = None,
+    account_capital: float = 100000.0,
 ) -> dict[str, Any]:
-    """Calculates ATM option strike, option type, buying premium, and target premiums."""
-    step = getattr(settings, "STRIKE_ROUND_TO", 50)
-    strike = int(round(spot / step) * step)
-    opt_type = "CE" if direction == "LONG" else "PE"
-    symbol = f"NIFTY {strike} {opt_type}"
+    """Calculates slightly ITM option strike (delta 0.65-0.75), entry premium, and target premiums.
+    
+    Rule (Phase 15.1):
+    - Strike = delta 0.65-0.75 (slightly ITM).
+    - Live delta from chain IV / empirical; replay uses 0.65.
+    - Capital gate: premium * 75 <= 70% of account.
+    - All premium conversions use actual delta - flat 0.5 banned.
+    """
+    from engines.delta_execution import select_delta_aware_strike
+    strike_res = select_delta_aware_strike(
+        spot=spot,
+        direction=direction,
+        chain_snapshot=chain_snapshot,
+        expiry=expiry or "",
+    )
+    strike = strike_res["strike"]
+    opt_type = strike_res["option_type"]
+    symbol = strike_res["option_symbol"]
+    resolved_expiry = strike_res.get("expiry") or expiry or ""
+    entry_prem = strike_res["entry_prem"]
 
-    ltp = None
-    if chain_snapshot is not None:
-        try:
-            from main import option_ltp_for
-            ltp = option_ltp_for(chain_snapshot, strike, direction)
-        except Exception:
-            pass
+    if chain_snapshot is None:
+        delta = 0.65
+    else:
+        delta = strike_res.get("delta", 0.65)
+        if delta < 0.50 or delta > 0.90:
+            delta = 0.65
 
-    beta = getattr(settings, "PREMIUM_BETA", 0.50)
-    if ltp is None or ltp <= 0:
-        # Standard realistic weekly ATM premium baseline (~0.65% of spot)
-        base_atm = max(80.0, round((spot * 0.0065) / 5.0) * 5.0)
-        ltp = base_atm
+    # Capital Gate: premium * 75 <= 70% of account
+    lot_size = getattr(settings, "LOT_SIZE", 75)
+    total_cap = getattr(settings, "TOTAL_CAPITAL", account_capital)
+    max_capital = 0.70 * total_cap
+    capital_req = entry_prem * lot_size
+    capital_passed = (capital_req <= max_capital)
 
-    prem_risk = round(risk_pts * beta, 1)
-    sl_prem = max(5.0, round(ltp - prem_risk, 1))
-    tgt1_gain = round(abs(tgt1_price - spot) * beta, 1)
-    tgt2_gain = round(abs(tgt2_price - spot) * beta, 1)
-    tgt1_prem = round(ltp + tgt1_gain, 1)
-    tgt2_prem = round(ltp + tgt2_gain, 1)
+    # Actual delta conversions (flat 0.5 banned)
+    prem_risk = round(risk_pts * delta, 1)
+    sl_prem = max(5.0, round(entry_prem - prem_risk, 1))
+    tgt1_gain = round(abs(tgt1_price - spot) * delta, 1)
+    tgt2_gain = round(abs(tgt2_price - spot) * delta, 1)
+    tgt1_prem = round(entry_prem + tgt1_gain, 1)
+    tgt2_prem = round(entry_prem + tgt2_gain, 1)
 
     return {
         "strike": strike,
         "option_type": opt_type,
         "option_symbol": symbol,
-        "entry_prem": ltp,
+        "expiry": resolved_expiry,
+        "entry_prem": entry_prem,
         "sl_prem": sl_prem,
         "tgt1_prem": tgt1_prem,
         "tgt2_prem": tgt2_prem,
+        "delta": delta,
+        "capital_passed": capital_passed,
+        "capital_req": capital_req,
+        "max_capital": max_capital,
     }
+
+
+_DISPATCHED_SNIPER_EVENTS: set[str] = set()
 
 
 def dispatch_telegram_alert(event_type: str, trade: Any) -> None:
@@ -1146,6 +1196,46 @@ def dispatch_telegram_alert(event_type: str, trade: Any) -> None:
         sender = TelegramSender()
         if not sender.configured:
             return
+
+        trade_id = getattr(trade, "trade_id", "")
+        dedup_key = f"{event_type}:{trade_id}"
+        if dedup_key in _DISPATCHED_SNIPER_EVENTS:
+            log.info("Telegram alert suppressed (duplicate event %s already sent)", dedup_key)
+            return
+
+        # STALE CANDLE GUARD: Never dispatch entry alerts for stale/completed past candles
+        # Note: entry_time is candle START time (e.g. 13:55). The candle closes at 14:00 (5m later).
+        # Age must be measured from candle close/end time, not from candle start time.
+        if event_type == "ENTRY":
+            entry_time_str = getattr(trade, "entry_time", "")
+            if entry_time_str:
+                try:
+                    entry_dt = datetime.fromisoformat(entry_time_str)
+                    candle_end_dt = entry_dt + timedelta(minutes=5)
+                    age_sec = (ist_now() - candle_end_dt).total_seconds()
+                    max_age = getattr(settings, "STALE_CANDLE_MAX_AGE_SEC", 360)
+                    if age_sec > max_age:
+                        log.warning(
+                            "Telegram ENTRY alert suppressed (candle %s closed %.0f s ago > %d s)",
+                            entry_time_str, age_sec, max_age
+                        )
+                        return
+                except Exception:
+                    pass
+
+        # NO SILENT TRADES GUARD: Never announce TGT1, TGT2, or EXIT unless ENTRY was announced to Telegram!
+        if event_type in ("TGT1", "TGT2", "EXIT"):
+            entry_key = f"ENTRY:{trade_id}"
+            if entry_key not in _DISPATCHED_SNIPER_EVENTS:
+                log.warning(
+                    "Telegram %s alert suppressed for %s (NO_SILENT_TRADES: ENTRY was not announced)",
+                    event_type, trade_id
+                )
+                return
+
+        _DISPATCHED_SNIPER_EVENTS.add(dedup_key)
+
+        expiry = getattr(trade, "expiry", "")
         if event_type == "ENTRY":
             msg = format_sniper_entry_alert(
                 trade_id=trade.trade_id,
@@ -1166,6 +1256,10 @@ def dispatch_telegram_alert(event_type: str, trade: Any) -> None:
                 sl_prem=getattr(trade, "sl_prem", 0.0),
                 tgt1_prem=getattr(trade, "tgt1_prem", 0.0),
                 tgt2_prem=getattr(trade, "tgt2_prem", 0.0),
+                expiry=expiry,
+                delta=getattr(trade, "delta", 0.65),
+                confluence_bonus=bool(getattr(trade, "confluence_bonus", 0)),
+                ride_target_prem_pts=getattr(trade, "ride_target_prem_pts", 0.0),
             )
             sender.send(msg)
         elif event_type == "TGT1":
@@ -1181,6 +1275,7 @@ def dispatch_telegram_alert(event_type: str, trade: Any) -> None:
                 entry_prem=getattr(trade, "entry_prem", 0.0),
                 tgt1_prem=getattr(trade, "tgt1_prem", 0.0),
                 tgt2_prem=getattr(trade, "tgt2_prem", 0.0),
+                expiry=expiry,
             )
             sender.send(msg)
         elif event_type == "EXIT":
@@ -1208,6 +1303,7 @@ def dispatch_telegram_alert(event_type: str, trade: Any) -> None:
                 option_symbol=getattr(trade, "option_symbol", ""),
                 entry_prem=getattr(trade, "entry_prem", 0.0),
                 exit_prem=exit_prem,
+                expiry=expiry,
             )
             sender.send(msg)
     except Exception as exc:
@@ -1244,6 +1340,30 @@ class LiquidityTrendlineFibEngine:
         self.swing_lows: list[tuple[float, int, datetime]] = []
         self.trades: list[LiquidityTrendlineTrade] = []
         self.active_trade: LiquidityTrendlineTrade | None = None
+        self.last_traded_pivots: tuple[int, int] | None = None
+        self.blocked: bool = False
+
+    def _journal_event(self, event_type: str, trade: LiquidityTrendlineTrade, notes: str | None = None) -> None:
+        if not self.store:
+            return
+        try:
+            event_ts = trade.exit_time if (event_type == "EXIT" and trade.exit_time) else trade.entry_time
+            self.store.journal_event(
+                event_type,
+                direction=trade.direction,
+                strike=trade.strike,
+                spot=trade.exit_price if event_type == "EXIT" else trade.entry_price,
+                option_ltp=trade.exit_prem if event_type == "EXIT" else trade.entry_prem,
+                trade_id=trade.trade_id,
+                result_r=trade.realized_r if event_type == "EXIT" else None,
+                exit_reason=trade.exit_reason if event_type == "EXIT" else None,
+                family="TL-FIB",
+                notes=notes or f"[TL-FIB] {trade.trade_id} {event_type} | {trade.setup_name} | {trade.notes}",
+                reasons=trade.to_dict(),
+                ts=event_ts,
+            )
+        except Exception as exc:
+            log.warning("Could not journal trendline fib trade event: %s", exc)
 
     def on_candle(self, c: Candle, chain_snapshot: Any = None) -> list[LiquidityTrendlineTrade]:
         if chain_snapshot is not None:
@@ -1266,7 +1386,7 @@ class LiquidityTrendlineFibEngine:
                 if not self.swing_lows or abs(prev1.low - self.swing_lows[-1][0]) > 2.0:
                     self.swing_lows.append((prev1.low, c_idx - 1, prev1.start))
 
-        if self.active_trade is None and len(self.swing_highs) >= 1 and len(self.swing_lows) >= 1:
+        if not getattr(self, "blocked", False) and self.active_trade is None and len(self.swing_highs) >= 1 and len(self.swing_lows) >= 1:
             self._check_setup(c, c_idx)
 
         return self.trades
@@ -1276,85 +1396,162 @@ class LiquidityTrendlineFibEngine:
         if not t:
             return
 
+        # 15:10 IST EOD SQUARE-OFF
+        if c.start.time() >= dt_time(15, 10):
+            self.square_off(exit_price=c.close, exit_time=c.start)
+            return
+
         if t.direction == "SHORT":
-            if c.high >= t.current_sl:
+            t.lowest_spot = min(getattr(t, "lowest_spot", t.entry_price) or t.entry_price, c.low)
+            t.highest_spot = max(getattr(t, "highest_spot", t.entry_price) or t.entry_price, c.high)
+
+            # Intrabar Hard SL Protection (Initial SL is max emergency risk boundary)
+            if c.high >= t.initial_sl and t.current_sl >= t.initial_sl:
                 t.status = "CLOSED"
-                t.exit_price = t.current_sl
+                t.exit_price = t.initial_sl
                 t.exit_time = c.start.isoformat()
-                t.exit_reason = "BE_SL" if t.half_booked else "SL_HIT"
-                t.realized_r = 0.50 if t.half_booked else -1.00
-                t.notes = "Partial TGT1 (+1.0R) + Breakeven Stop Locked (+0.50R)" if t.half_booked else "Stop Loss Hit (-1.0R)"
-                t.exit_prem = t.entry_prem if t.half_booked else t.sl_prem
+                t.exit_reason = "SL_HIT"
+                t.realized_r = -1.00
+                t.notes = f"Initial Stop Loss Hit at {t.initial_sl:.1f} (-1.0R)"
+                t.exit_prem = t.sl_prem
                 self.trades.append(t)
                 self.active_trade = None
+                self._journal_event("EXIT", t)
                 if self.notifier:
                     self.notifier("EXIT", t)
                 return
 
-            if not t.half_booked and c.low <= t.tgt1_price:
-                t.half_booked = True
-                t.current_sl = t.entry_price  # Breakeven stop
-                t.status = "PARTIAL_TGT1"
+            # Checkpoint only: First Pivot reached (never auto-exit)
+            if not t.checkpoint_hit and c.low <= t.tgt1_price:
+                t.checkpoint_hit = True
+                t.status = "CHECKPOINT_HIT"
+                self._journal_event(
+                    "UPDATE",
+                    t,
+                    notes=f"[TL-FIB] {t.trade_id} First Pivot Checkpoint cleared ({t.tgt1_price:.1f}). Structure trailing active (No auto-exit).",
+                )
                 if self.notifier:
                     self.notifier("TGT1", t)
 
-            if t.half_booked and c.low <= t.tgt2_price:
-                t1_r = max(1.0, (t.entry_price - t.tgt1_price) / t.risk_pts)
-                t2_r = max(1.5, (t.entry_price - t.tgt2_price) / t.risk_pts)
-                t.realized_r = round(0.50 * t1_r + 0.50 * t2_r, 2)
+            # Optional single 30% partial booking ONLY at major wall with profit >= 15 prem pts
+            gain_prem = (t.entry_price - c.low) * t.delta
+            at_major_wall = (self.val > 0 and c.low <= self.val)
+            if not t.wall_booked and gain_prem >= 15.0 and at_major_wall:
+                t.wall_booked = True
+                t.booked_fraction = 0.30
+                t.status = "WALL_PARTIAL"
+                t.current_sl = min(t.current_sl, t.entry_price)
+                self._journal_event(
+                    "UPDATE",
+                    t,
+                    notes=f"[TL-FIB] {t.trade_id} 30% booked at major wall ({c.low:.1f}). Trailing structure with 70% runner.",
+                )
+
+            # Ratchet 5-min Structure Lower High
+            # In a downtrend, a valid lower high candle is bearish (close < open) with high < previous LH and low <= lowest_spot
+            last_lh = getattr(t, "last_lower_high", None)
+            if (last_lh is None or c.high < last_lh) and c.close < c.open and c.low <= t.lowest_spot:
+                t.last_lower_high = c.high
+                new_trail = round(c.high + 2.0, 1)
+                if new_trail < t.current_sl:
+                    t.current_sl = new_trail
+
+            # Structure Break Exit: 5-min candle closes above trailed SL
+            if c.close > t.current_sl:
                 t.status = "CLOSED"
-                t.exit_price = t.tgt2_price
+                t.exit_price = c.close
                 t.exit_time = c.start.isoformat()
-                t.exit_reason = "FIB_EXT_TGT2_HIT"
-                t.exit_prem = t.tgt2_prem
+                is_trail = (t.current_sl < t.initial_sl)
+                t.exit_reason = "5M_STRUCTURE_TRAIL" if is_trail else "SL_HIT"
+                spot_pts = t.entry_price - c.close
+                t.exit_prem = max(0.5, round(t.entry_prem + (spot_pts * t.delta), 1))
+                if t.wall_booked:
+                    t.realized_r = round(0.30 * (15.0 / (t.risk_pts * t.delta)) + 0.70 * (spot_pts / t.risk_pts), 2)
+                else:
+                    t.realized_r = round(spot_pts / t.risk_pts, 2)
+                t.notes = f"5-min close {c.close:.1f} broke structure trail {t.current_sl:.1f}" if is_trail else "Stop Loss Hit (-1.0R)"
                 self.trades.append(t)
                 self.active_trade = None
+                self._journal_event("EXIT", t)
                 if self.notifier:
                     self.notifier("EXIT", t)
                 return
-
-            if t.half_booked and c.high < t.current_sl:
-                t.current_sl = min(t.current_sl, c.high + 2.0)
 
         else:  # LONG
-            if c.low <= t.current_sl:
+            t.highest_spot = max(getattr(t, "highest_spot", t.entry_price) or t.entry_price, c.high)
+            t.lowest_spot = min(getattr(t, "lowest_spot", t.entry_price) or t.entry_price, c.low)
+
+            # Intrabar Hard SL Protection (Initial SL is max emergency risk boundary)
+            if c.low <= t.initial_sl and t.current_sl <= t.initial_sl:
                 t.status = "CLOSED"
-                t.exit_price = t.current_sl
+                t.exit_price = t.initial_sl
                 t.exit_time = c.start.isoformat()
-                t.exit_reason = "BE_SL" if t.half_booked else "SL_HIT"
-                t.realized_r = 0.50 if t.half_booked else -1.00
-                t.notes = "Partial TGT1 (+1.0R) + Breakeven Stop Locked (+0.50R)" if t.half_booked else "Stop Loss Hit (-1.0R)"
-                t.exit_prem = t.entry_prem if t.half_booked else t.sl_prem
+                t.exit_reason = "SL_HIT"
+                t.realized_r = -1.00
+                t.notes = f"Initial Stop Loss Hit at {t.initial_sl:.1f} (-1.0R)"
+                t.exit_prem = t.sl_prem
                 self.trades.append(t)
                 self.active_trade = None
+                self._journal_event("EXIT", t)
                 if self.notifier:
                     self.notifier("EXIT", t)
                 return
 
-            if not t.half_booked and c.high >= t.tgt1_price:
-                t.half_booked = True
-                t.current_sl = t.entry_price  # Breakeven stop
-                t.status = "PARTIAL_TGT1"
+            # Checkpoint only: First Pivot reached (never auto-exit)
+            if not t.checkpoint_hit and c.high >= t.tgt1_price:
+                t.checkpoint_hit = True
+                t.status = "CHECKPOINT_HIT"
+                self._journal_event(
+                    "UPDATE",
+                    t,
+                    notes=f"[TL-FIB] {t.trade_id} First Pivot Checkpoint cleared ({t.tgt1_price:.1f}). Structure trailing active (No auto-exit).",
+                )
                 if self.notifier:
                     self.notifier("TGT1", t)
 
-            if t.half_booked and c.high >= t.tgt2_price:
-                t1_r = max(1.0, (t.tgt1_price - t.entry_price) / t.risk_pts)
-                t2_r = max(1.5, (t.tgt2_price - t.entry_price) / t.risk_pts)
-                t.realized_r = round(0.50 * t1_r + 0.50 * t2_r, 2)
+            # Optional single 30% partial booking ONLY at major wall with profit >= 15 prem pts
+            gain_prem = (c.high - t.entry_price) * t.delta
+            at_major_wall = (self.vah > 0 and c.high >= self.vah)
+            if not t.wall_booked and gain_prem >= 15.0 and at_major_wall:
+                t.wall_booked = True
+                t.booked_fraction = 0.30
+                t.status = "WALL_PARTIAL"
+                t.current_sl = max(t.current_sl, t.entry_price)
+                self._journal_event(
+                    "UPDATE",
+                    t,
+                    notes=f"[TL-FIB] {t.trade_id} 30% booked at major wall ({c.high:.1f}). Trailing structure with 70% runner.",
+                )
+
+            # Ratchet 5-min Structure Higher Low
+            # In an uptrend, a valid higher low candle is bullish (close > open) with low > previous HL and high >= highest_spot
+            last_hl = getattr(t, "last_higher_low", None)
+            if (last_hl is None or c.low > last_hl) and c.close > c.open and c.high >= t.highest_spot:
+                t.last_higher_low = c.low
+                new_trail = round(c.low - 2.0, 1)
+                if new_trail > t.current_sl:
+                    t.current_sl = new_trail
+
+            # Structure Break Exit: 5-min candle closes below trailed SL
+            if c.close < t.current_sl:
                 t.status = "CLOSED"
-                t.exit_price = t.tgt2_price
+                t.exit_price = c.close
                 t.exit_time = c.start.isoformat()
-                t.exit_reason = "FIB_EXT_TGT2_HIT"
-                t.exit_prem = t.tgt2_prem
+                is_trail = (t.current_sl > t.initial_sl)
+                t.exit_reason = "5M_STRUCTURE_TRAIL" if is_trail else "SL_HIT"
+                spot_pts = c.close - t.entry_price
+                t.exit_prem = max(0.5, round(t.entry_prem + (spot_pts * t.delta), 1))
+                if t.wall_booked:
+                    t.realized_r = round(0.30 * (15.0 / (t.risk_pts * t.delta)) + 0.70 * (spot_pts / t.risk_pts), 2)
+                else:
+                    t.realized_r = round(spot_pts / t.risk_pts, 2)
+                t.notes = f"5-min close {c.close:.1f} broke structure trail {t.current_sl:.1f}" if is_trail else "Stop Loss Hit (-1.0R)"
                 self.trades.append(t)
                 self.active_trade = None
+                self._journal_event("EXIT", t)
                 if self.notifier:
                     self.notifier("EXIT", t)
                 return
-
-            if t.half_booked and c.low > t.current_sl:
-                t.current_sl = max(t.current_sl, c.low - 2.0)
 
     def get_intraday_trend(self) -> str:
         """Determines active intraday trend: 'DOWNTREND', 'UPTREND', or 'RANGE'.
@@ -1409,12 +1606,19 @@ class LiquidityTrendlineFibEngine:
         return None, None
 
     def _check_setup(self, c: Candle, c_idx: int) -> None:
+        if getattr(self, "blocked", False):
+            return
+
         # TIME GATE: No new entries after 14:00 IST (avoids late-session chop and EOD theta crush)
         if c.start.hour >= 14:
             return
 
         last_sh = self.swing_highs[-1]
         last_sl = self.swing_lows[-1]
+
+        # ONE TRADE PER SWING IMPULSE: Prevent re-entries on the identical swing pivot leg
+        if self.last_traded_pivots == (last_sh[1], last_sl[1]):
+            return
 
         c_range = max(0.1, c.high - c.low)
         trend = self.get_intraday_trend()
@@ -1429,7 +1633,8 @@ class LiquidityTrendlineFibEngine:
             sl_px = last_sl[0]
             H = sh_px - sl_px
 
-            if H >= 15.0 and c.high < sh_px:
+            # IMPULSE PRE-FILTER: H >= 30.0 pts (Phase 15.1 Fix 2)
+            if H >= 30.0 and c.high < sh_px:
                 fib_50 = sl_px + 0.50 * H
                 fib_618 = sl_px + 0.618 * H
                 fib_705 = sl_px + 0.705 * H
@@ -1450,8 +1655,10 @@ class LiquidityTrendlineFibEngine:
                         return
                     sl = min(sh_px + 2.0, entry + 33.0)
                     risk = max(10.0, sl - entry)
-                    tgt1 = sl_px
-                    tgt2 = min(self.val, sl_px - 0.618 * H) if (self.val > 0 and self.val < sl_px) else (sl_px - 0.618 * H)
+                    tgt1 = sl_px  # First pivot checkpoint
+                    # Computed ride target: 1.272xH Fib extension
+                    fib_ext_ride = sl_px - 0.272 * H
+                    tgt2 = min(self.val, fib_ext_ride) if (self.val > 0 and self.val < sl_px) else fib_ext_ride
 
                     opt_leg = compute_option_leg(
                         spot=entry,
@@ -1462,6 +1669,30 @@ class LiquidityTrendlineFibEngine:
                         chain_snapshot=getattr(self, "chain_snapshot", None),
                     )
 
+                    # CAPITAL GATE: premium * 75 <= 70% of account
+                    if not opt_leg.get("capital_passed", True):
+                        return
+
+                    # SCALP-KILLER GATE: Computed ride target must be >= 20 PREMIUM pts at live delta
+                    delta_used = opt_leg.get("delta", 0.65)
+                    spot_ride_pts = abs(tgt2 - entry)
+                    prem_ride_pts = round(spot_ride_pts * delta_used, 1)
+                    if prem_ride_pts < 20.0:
+                        return
+
+                    # ZONE CONFLUENCE BONUS: golden pocket coinciding with an OI wall = +10 priority (live only)
+                    confluence_bonus = 0
+                    if getattr(self, "chain_snapshot", None) and hasattr(self.chain_snapshot, "rows"):
+                        for r in self.chain_snapshot.rows:
+                            strk = float(getattr(r, "strike", 0))
+                            if abs(strk - fib_618) <= 15.0:
+                                if float(getattr(r, "ce_oi", 0) or 0) > 100_000:
+                                    confluence_bonus = 10
+                                    break
+                    if confluence_bonus > 0:
+                        conf_suffix += " [OI Wall Confluence +10]"
+
+                    self.last_traded_pivots = (last_sh[1], last_sl[1])
                     self.active_trade = LiquidityTrendlineTrade(
                         trade_id=f"TL-FIB-S-{len(self.trades)+1:03d}",
                         direction="SHORT",
@@ -1480,11 +1711,19 @@ class LiquidityTrendlineFibEngine:
                         strike=opt_leg["strike"],
                         option_type=opt_leg["option_type"],
                         option_symbol=opt_leg["option_symbol"],
+                        expiry=opt_leg.get("expiry", ""),
                         entry_prem=opt_leg["entry_prem"],
                         sl_prem=opt_leg["sl_prem"],
                         tgt1_prem=opt_leg["tgt1_prem"],
                         tgt2_prem=opt_leg["tgt2_prem"],
+                        delta=delta_used,
+                        ride_target_prem_pts=prem_ride_pts,
+                        confluence_bonus=confluence_bonus,
+                        highest_spot=entry,
+                        lowest_spot=entry,
+                        last_lower_high=entry,
                     )
+                    self._journal_event("SIGNAL", self.active_trade)
                     if self.notifier:
                         self.notifier("ENTRY", self.active_trade)
                     return
@@ -1499,7 +1738,8 @@ class LiquidityTrendlineFibEngine:
             sl_px = last_sl[0]
             H = sh_px - sl_px
 
-            if H >= 15.0 and c.low > sl_px:
+            # IMPULSE PRE-FILTER: H >= 30.0 pts (Phase 15.1 Fix 2)
+            if H >= 30.0 and c.low > sl_px:
                 fib_50 = sh_px - 0.50 * H
                 fib_618 = sh_px - 0.618 * H
                 fib_705 = sh_px - 0.705 * H
@@ -1520,8 +1760,10 @@ class LiquidityTrendlineFibEngine:
                         return
                     sl = max(sl_px - 2.0, entry - 33.0)
                     risk = max(10.0, entry - sl)
-                    tgt1 = sh_px
-                    tgt2 = max(self.vah, sh_px + 0.618 * H) if (self.vah > 0 and self.vah > sh_px) else (sh_px + 0.618 * H)
+                    tgt1 = sh_px  # First pivot checkpoint
+                    # Computed ride target: 1.272xH Fib extension
+                    fib_ext_ride = sh_px + 0.272 * H
+                    tgt2 = max(self.vah, fib_ext_ride) if (self.vah > 0 and self.vah > sh_px) else fib_ext_ride
 
                     opt_leg = compute_option_leg(
                         spot=entry,
@@ -1532,6 +1774,30 @@ class LiquidityTrendlineFibEngine:
                         chain_snapshot=getattr(self, "chain_snapshot", None),
                     )
 
+                    # CAPITAL GATE: premium * 75 <= 70% of account
+                    if not opt_leg.get("capital_passed", True):
+                        return
+
+                    # SCALP-KILLER GATE: Computed ride target must be >= 20 PREMIUM pts at live delta
+                    delta_used = opt_leg.get("delta", 0.65)
+                    spot_ride_pts = abs(tgt2 - entry)
+                    prem_ride_pts = round(spot_ride_pts * delta_used, 1)
+                    if prem_ride_pts < 20.0:
+                        return
+
+                    # ZONE CONFLUENCE BONUS: golden pocket coinciding with an OI wall = +10 priority (live only)
+                    confluence_bonus = 0
+                    if getattr(self, "chain_snapshot", None) and hasattr(self.chain_snapshot, "rows"):
+                        for r in self.chain_snapshot.rows:
+                            strk = float(getattr(r, "strike", 0))
+                            if abs(strk - fib_618) <= 15.0:
+                                if float(getattr(r, "pe_oi", 0) or 0) > 100_000:
+                                    confluence_bonus = 10
+                                    break
+                    if confluence_bonus > 0:
+                        conf_suffix += " [OI Wall Confluence +10]"
+
+                    self.last_traded_pivots = (last_sh[1], last_sl[1])
                     self.active_trade = LiquidityTrendlineTrade(
                         trade_id=f"TL-FIB-L-{len(self.trades)+1:03d}",
                         direction="LONG",
@@ -1550,11 +1816,19 @@ class LiquidityTrendlineFibEngine:
                         strike=opt_leg["strike"],
                         option_type=opt_leg["option_type"],
                         option_symbol=opt_leg["option_symbol"],
+                        expiry=opt_leg.get("expiry", ""),
                         entry_prem=opt_leg["entry_prem"],
                         sl_prem=opt_leg["sl_prem"],
                         tgt1_prem=opt_leg["tgt1_prem"],
                         tgt2_prem=opt_leg["tgt2_prem"],
+                        delta=delta_used,
+                        ride_target_prem_pts=prem_ride_pts,
+                        confluence_bonus=confluence_bonus,
+                        highest_spot=entry,
+                        lowest_spot=entry,
+                        last_higher_low=entry,
                     )
+                    self._journal_event("SIGNAL", self.active_trade)
                     if self.notifier:
                         self.notifier("ENTRY", self.active_trade)
                     return
@@ -1566,23 +1840,639 @@ class LiquidityTrendlineFibEngine:
             return []
         px = exit_price or t.entry_price
         pts = (px - t.entry_price) if t.direction == "LONG" else (t.entry_price - px)
-        runner_r = pts / t.risk_pts
-        if t.half_booked:
-            t1_r = max(1.0, abs(t.tgt1_price - t.entry_price) / t.risk_pts)
-            t.realized_r = round(0.50 * t1_r + 0.50 * runner_r, 2)
+        runner_r = pts / max(1.0, t.risk_pts)
+        delta_val = getattr(t, "delta", 0.65)
+        if getattr(t, "wall_booked", False):
+            t.realized_r = round(0.30 * (15.0 / (t.risk_pts * delta_val)) + 0.70 * runner_r, 2)
         else:
             t.realized_r = round(runner_r, 2)
         t.status = "CLOSED"
         t.exit_price = px
         t.exit_time = exit_time.isoformat()
         t.exit_reason = "SQUARE_OFF_1510"
-        beta = getattr(settings, "PREMIUM_BETA", 0.50)
-        t.exit_prem = max(0.5, round(t.entry_prem + (pts * beta), 1))
+        t.exit_prem = max(0.5, round(t.entry_prem + (pts * delta_val), 1))
         self.trades.append(t)
         self.active_trade = None
+        self._journal_event("EXIT", t)
         if self.notifier:
             self.notifier("EXIT", t)
         return [t]
+
+
+# =============================================================================
+# ARM 3: LIQUIDITY ZONE REVERSAL ENGINE (2-Candle Rule)
+# =============================================================================
+
+@dataclass
+class ZoneReversalTrade:
+    """Trade record for Arm 3: Liquidity Zone Reversal."""
+    trade_id: str
+    direction: str              # "LONG" or "SHORT"
+    entry_price: float
+    initial_sl: float
+    current_sl: float
+    risk_pts: float
+    tgt1_price: float           # Nearest opposing level (checkpoint)
+    tgt2_price: float           # Far target (~2x or next zone)
+    entry_time: str
+    level_name: str             # "PDH", "PDL", "OI_CALL", "OI_PUT", "TRENDLINE_HI", "TRENDLINE_LO"
+    level_price: float
+    setup_name: str = ""
+    notes: str = ""
+    status: str = "OPEN"        # "OPEN", "CLOSED"
+    exit_price: float | None = None
+    exit_time: str | None = None
+    exit_reason: str | None = None
+    realized_r: float = 0.0
+    # Structural trail tracking
+    last_structure_point: float = 0.0   # last higher-low (LONG) or lower-high (SHORT)
+    # Option fields (mirror Arm 2)
+    strike: int = 0
+    option_type: str = ""
+    option_symbol: str = ""
+    expiry: str = ""
+    entry_prem: float = 0.0
+    sl_prem: float = 0.0
+    tgt1_prem: float = 0.0
+    tgt2_prem: float = 0.0
+    exit_prem: float | None = None
+    delta: float = 0.65
+    confluence_bonus: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class _ZoneLevel:
+    """Internal: a marked liquidity level for Arm 3."""
+    name: str           # "PDH", "PDL", "OI_CALL", "OI_PUT"
+    price: float
+    level_type: str     # "RESISTANCE" or "SUPPORT"
+    tag: str = "NORMAL" # "STRONG" if OI + structure confluence
+
+
+@dataclass
+class _ZoneState:
+    """State machine for a single level's 2-candle confirmation."""
+    level: _ZoneLevel
+    # After candle-1 closes through the level
+    candle1_close: float = 0.0
+    candle1_time: str = ""
+    candle1_direction: str = ""     # "UP_BREAK" or "DOWN_BREAK"
+    waiting_confirm: bool = False   # True after candle-1 fires
+    # Number of bars we allow for candle-2 reversal confirmation
+    CONFIRM_TIMEOUT: int = 3
+
+    def reset(self) -> None:
+        self.candle1_close = 0.0
+        self.candle1_time = ""
+        self.candle1_direction = ""
+        self.waiting_confirm = False
+
+
+class LiquidityZoneReversalEngine:
+    """ARM 3: Clean 2-Candle Liquidity Zone Reversal Engine.
+
+    Core Logic (production-grade, based on user strategy spec):
+    ─────────────────────────────────────────────────────────
+    LEVELS (set at 09:15 each day):
+      • PDH  → Resistance
+      • PDL  → Support
+      • Top Call-OI strike (>50k OI) → Resistance
+      • Top Put-OI strike  (>50k OI) → Support
+
+    SIGNAL SEQUENCE (2-candle rule):
+      1. CANDLE-1: 5-min candle closes BEYOND a marked level.
+           - Resistance break: close > level  (UP_BREAK)
+           - Support   break: close < level   (DOWN_BREAK)
+      2. CANDLE-2: Next candle confirms REVERSAL back through the level.
+           - After UP_BREAK:   next candle close < level → SHORT signal  (buy PE)
+           - After DOWN_BREAK: next candle close > level → LONG  signal  (buy CE)
+         • If no reversal within 3 bars → state reset (was a real breakout)
+
+    TRENDLINE REJECTION (secondary, runs in parallel):
+      • Swing highs/lows updated every candle (rolling 20-bar pivot)
+      • Resistance trendline from last 2 swing highs
+      • Support    trendline from last 2 swing lows
+      • Price touches trendline AND candle closes back with body >= 50% of range → ENTRY
+
+    EXIT (structural trail — same as Arm 2):
+      • For LONG:  SL trails to last 5-min higher-low
+      • For SHORT: SL trails to last 5-min lower-high
+      • Optional single 30% partial if profit >= 15 prem pts AND far target reached
+      • 15:10 square-off
+      • Max SL: 33 spot pts
+      • Max 3 trades per session
+
+    INSTRUMENT: delta 0.65-0.75 ITM (same as Arm 2 via compute_option_leg)
+    """
+
+    MAX_DAILY_TRADES: int = 3
+    MAX_SL_PTS: float = 33.0
+    MIN_TARGET_PTS: float = 20.0     # minimum ride distance in spot pts
+    TRAIL_LOOKBACK: int = 3          # bars to look back for structure point
+    SWING_LOOKBACK: int = 20         # bars for trendline pivot detection
+    CONFIRM_TIMEOUT: int = 3         # max bars to wait for candle-2 reversal
+
+    def __init__(
+        self,
+        pdh: float | None = None,
+        pdl: float | None = None,
+        oi_call_level: float | None = None,
+        oi_put_level: float | None = None,
+        store: Any = None,
+        notifier: Any = None,
+    ):
+        self.pdh = pdh
+        self.pdl = pdl
+        self.oi_call_level = oi_call_level
+        self.oi_put_level = oi_put_level
+        self.store = store
+        self.notifier = notifier
+        self.chain_snapshot: Any = None
+        self.blocked: bool = False
+
+        self.levels: list[_ZoneLevel] = []
+        self._zone_states: list[_ZoneState] = []
+        self.active_trade: ZoneReversalTrade | None = None
+        self.trades: list[ZoneReversalTrade] = []
+        self._trade_counter: int = 0
+        self._daily_trade_count: int = 0
+
+        # Candle history for trendline & structural trail
+        self._candle_history: list[Candle] = []
+        self._swing_highs: list[tuple[int, float]] = []   # (index, price)
+        self._swing_lows: list[tuple[int, float]] = []    # (index, price)
+
+        # Confirm-timeout counters per zone state
+        self._confirm_bars: list[int] = []
+
+        if pdh is not None and pdl is not None:
+            self._build_levels()
+
+    # ── Level Construction ────────────────────────────────────────────────────
+
+    def _build_levels(self) -> None:
+        """Build the level set from PDH/PDL and optional OI strikes."""
+        self.levels = []
+        if self.pdh and self.pdh > 0:
+            self.levels.append(_ZoneLevel(name="PDH", price=self.pdh, level_type="RESISTANCE", tag="STRONG"))
+        if self.pdl and self.pdl > 0:
+            self.levels.append(_ZoneLevel(name="PDL", price=self.pdl, level_type="SUPPORT", tag="STRONG"))
+        if self.oi_call_level and self.oi_call_level > 0:
+            self.levels.append(_ZoneLevel(name="OI_CALL", price=self.oi_call_level, level_type="RESISTANCE", tag="STRONG"))
+        if self.oi_put_level and self.oi_put_level > 0:
+            self.levels.append(_ZoneLevel(name="OI_PUT", price=self.oi_put_level, level_type="SUPPORT", tag="STRONG"))
+        # Initialise zone states
+        self._zone_states = [_ZoneState(level=lvl) for lvl in self.levels]
+        self._confirm_bars = [0] * len(self.levels)
+
+    def initialize_levels(
+        self,
+        pdh: float,
+        pdl: float,
+        oi_call_level: float | None = None,
+        oi_put_level: float | None = None,
+    ) -> None:
+        """Call at 09:15 each session with fresh levels."""
+        self.pdh = pdh
+        self.pdl = pdl
+        self.oi_call_level = oi_call_level
+        self.oi_put_level = oi_put_level
+        self._daily_trade_count = 0
+        self._candle_history = []
+        self._swing_highs = []
+        self._swing_lows = []
+        self._build_levels()
+
+    # ── Swing / Trendline Helpers ────────────────────────────────────────────
+
+    def _update_swings(self) -> None:
+        """Update rolling swing highs/lows from recent candle history."""
+        n = len(self._candle_history)
+        if n < 5:
+            return
+        lb = min(self.SWING_LOOKBACK, n)
+        look = self._candle_history[-lb:]
+        half = 2  # pivot bars each side
+
+        # Detect pivot high: high > all 2 bars before & after
+        new_highs: list[tuple[int, float]] = []
+        new_lows: list[tuple[int, float]] = []
+        for i in range(half, len(look) - half):
+            h = look[i].high
+            l = look[i].low
+            if all(look[i-k].high <= h for k in range(1, half+1)) and \
+               all(look[i+k].high <= h for k in range(1, half+1)):
+                new_highs.append((n - lb + i, h))
+            if all(look[i-k].low >= l for k in range(1, half+1)) and \
+               all(look[i+k].low >= l for k in range(1, half+1)):
+                new_lows.append((n - lb + i, l))
+
+        if new_highs:
+            self._swing_highs = new_highs[-3:]
+        if new_lows:
+            self._swing_lows = new_lows[-3:]
+
+    def _get_trendline_value(self, swing_points: list[tuple[int, float]], current_idx: int) -> float | None:
+        """Project a trendline from 2 swing points to the current bar index."""
+        if len(swing_points) < 2:
+            return None
+        (x1, y1), (x2, y2) = swing_points[-2], swing_points[-1]
+        if x2 == x1:
+            return None
+        slope = (y2 - y1) / (x2 - x1)
+        return round(y1 + slope * (current_idx - x1), 2)
+
+    # ── Trade Construction ────────────────────────────────────────────────────
+
+    def _build_trade(
+        self,
+        c: Candle,
+        direction: str,
+        level_name: str,
+        level_price: float,
+        setup_name: str,
+        notes: str,
+        confluence_bonus: int = 0,
+    ) -> ZoneReversalTrade | None:
+        """Build a ZoneReversalTrade. Returns None if capital/SL gate fails."""
+        self._trade_counter += 1
+        tag = "L" if direction == "LONG" else "S"
+        tid = f"ZR-{tag}-{self._trade_counter:03d}"
+
+        entry = c.close
+        # SL: beyond the sweep candle's extreme (+ 3pt buffer), capped at MAX_SL_PTS
+        if direction == "LONG":
+            raw_sl = c.low - 3.0
+            sl = max(entry - self.MAX_SL_PTS, raw_sl)
+        else:
+            raw_sl = c.high + 3.0
+            sl = min(entry + self.MAX_SL_PTS, raw_sl)
+
+        risk_pts = abs(entry - sl)
+        if risk_pts < 5.0:
+            risk_pts = 10.0
+            sl = (entry - 10.0) if direction == "LONG" else (entry + 10.0)
+
+        # Target: next opposing level or 2× risk (min MIN_TARGET_PTS)
+        target_pts = max(self.MIN_TARGET_PTS, risk_pts * 2.0)
+        if direction == "LONG":
+            tgt1 = entry + target_pts * 0.5
+            tgt2 = entry + target_pts
+        else:
+            tgt1 = entry - target_pts * 0.5
+            tgt2 = entry - target_pts
+
+        # Option leg
+        try:
+            opt = compute_option_leg(
+                spot=entry,
+                direction=direction,
+                risk_pts=risk_pts,
+                tgt1_price=tgt1,
+                tgt2_price=tgt2,
+                chain_snapshot=self.chain_snapshot,
+            )
+        except Exception:
+            delta = 0.65
+            opt = {
+                "strike": int(round(entry / 50) * 50),
+                "option_type": "CE" if direction == "LONG" else "PE",
+                "option_symbol": f"NIFTY {int(round(entry/50)*50)} {'CE' if direction=='LONG' else 'PE'}",
+                "expiry": "",
+                "entry_prem": round(max(5.0, risk_pts * delta), 1),
+                "sl_prem": round(max(5.0, risk_pts * delta * 0.5), 1),
+                "tgt1_prem": round(risk_pts * delta * 1.5, 1),
+                "tgt2_prem": round(risk_pts * delta * 2.5, 1),
+                "delta": delta,
+                "capital_passed": True,
+            }
+
+        return ZoneReversalTrade(
+            trade_id=tid,
+            direction=direction,
+            entry_price=entry,
+            initial_sl=sl,
+            current_sl=sl,
+            risk_pts=risk_pts,
+            tgt1_price=tgt1,
+            tgt2_price=tgt2,
+            entry_time=c.start.isoformat(),
+            level_name=level_name,
+            level_price=level_price,
+            setup_name=setup_name,
+            notes=notes,
+            last_structure_point=c.low if direction == "LONG" else c.high,
+            strike=opt["strike"],
+            option_type=opt["option_type"],
+            option_symbol=opt["option_symbol"],
+            expiry=opt.get("expiry", ""),
+            entry_prem=opt["entry_prem"],
+            sl_prem=opt["sl_prem"],
+            tgt1_prem=opt["tgt1_prem"],
+            tgt2_prem=opt["tgt2_prem"],
+            delta=opt.get("delta", 0.65),
+            confluence_bonus=confluence_bonus,
+        )
+
+    # ── Active Trade Management ────────────────────────────────────────────────
+
+    def _manage_active(self, c: Candle) -> bool:
+        """Returns True if trade was closed on this candle."""
+        t = self.active_trade
+        if not t:
+            return False
+
+        delta = getattr(t, "delta", 0.65)
+
+        if t.direction == "LONG":
+            # Update structure: trail SL to last higher-low
+            if c.close > t.entry_price:  # only trail in profit
+                bars = self._candle_history[-self.TRAIL_LOOKBACK:] if self._candle_history else []
+                if bars:
+                    new_hl = min(b.low for b in bars)
+                    if new_hl > t.current_sl:
+                        t.current_sl = round(new_hl - 1.0, 1)
+                        t.last_structure_point = new_hl
+
+            if c.low <= t.current_sl:
+                exit_pts = t.entry_price - t.current_sl
+                t.realized_r = round(-exit_pts / max(1.0, t.risk_pts), 2) if exit_pts > 0 else round((t.entry_price - c.low) / max(1.0, t.risk_pts), 2)
+                # Check if SL was moved to breakeven (profit side)
+                if t.current_sl >= t.entry_price:
+                    t.exit_reason = "BE_SL"
+                    pts_gain = t.current_sl - t.entry_price
+                    t.realized_r = round(pts_gain / max(1.0, t.risk_pts), 2)
+                else:
+                    t.exit_reason = "SL_HIT"
+                    t.realized_r = round(-exit_pts / max(1.0, t.risk_pts), 2)
+                t.exit_price = t.current_sl
+                t.exit_prem = round(t.entry_prem - exit_pts * delta, 1)
+                t.exit_time = c.start.isoformat()
+                t.status = "CLOSED"
+                self.trades.append(t)
+                self.active_trade = None
+                self._daily_trade_count += 1
+                if self.notifier:
+                    self.notifier("EXIT", t)
+                return True
+
+            if c.high >= t.tgt2_price:
+                pts = t.tgt2_price - t.entry_price
+                t.realized_r = round(pts / max(1.0, t.risk_pts), 2)
+                t.exit_reason = "TGT2"
+                t.exit_price = t.tgt2_price
+                t.exit_prem = round(t.entry_prem + pts * delta, 1)
+                t.exit_time = c.start.isoformat()
+                t.status = "CLOSED"
+                self.trades.append(t)
+                self.active_trade = None
+                self._daily_trade_count += 1
+                if self.notifier:
+                    self.notifier("EXIT", t)
+                return True
+
+        else:  # SHORT
+            # Update structure: trail SL to last lower-high
+            if c.close < t.entry_price:  # only trail in profit
+                bars = self._candle_history[-self.TRAIL_LOOKBACK:] if self._candle_history else []
+                if bars:
+                    new_lh = max(b.high for b in bars)
+                    if new_lh < t.current_sl:
+                        t.current_sl = round(new_lh + 1.0, 1)
+                        t.last_structure_point = new_lh
+
+            if c.high >= t.current_sl:
+                if t.current_sl <= t.entry_price:
+                    t.exit_reason = "BE_SL"
+                    pts_gain = t.entry_price - t.current_sl
+                    t.realized_r = round(pts_gain / max(1.0, t.risk_pts), 2)
+                else:
+                    t.exit_reason = "SL_HIT"
+                    exit_pts = t.current_sl - t.entry_price
+                    t.realized_r = round(-exit_pts / max(1.0, t.risk_pts), 2)
+                t.exit_price = t.current_sl
+                exit_pts2 = abs(t.entry_price - t.current_sl)
+                t.exit_prem = round(t.entry_prem - exit_pts2 * delta, 1)
+                t.exit_time = c.start.isoformat()
+                t.status = "CLOSED"
+                self.trades.append(t)
+                self.active_trade = None
+                self._daily_trade_count += 1
+                if self.notifier:
+                    self.notifier("EXIT", t)
+                return True
+
+            if c.low <= t.tgt2_price:
+                pts = t.entry_price - t.tgt2_price
+                t.realized_r = round(pts / max(1.0, t.risk_pts), 2)
+                t.exit_reason = "TGT2"
+                t.exit_price = t.tgt2_price
+                t.exit_prem = round(t.entry_prem + pts * delta, 1)
+                t.exit_time = c.start.isoformat()
+                t.status = "CLOSED"
+                self.trades.append(t)
+                self.active_trade = None
+                self._daily_trade_count += 1
+                if self.notifier:
+                    self.notifier("EXIT", t)
+                return True
+
+        return False
+
+    # ── Main Candle Handler ────────────────────────────────────────────────────
+
+    def on_candle(self, c: Candle, chain: Any = None, day_state: Any = None) -> None:
+        """Process one closed 5-min candle."""
+        if chain is not None:
+            self.chain_snapshot = chain
+
+        self._candle_history.append(c)
+        self._update_swings()
+        current_idx = len(self._candle_history) - 1
+
+        # 1. Manage open position
+        if self.active_trade:
+            closed = self._manage_active(c)
+            if not closed:
+                return  # still in trade, don't look for new signals
+            # trade just closed — fall through to look for next signal
+
+        # 2. Check daily trade limit
+        if self._daily_trade_count >= self.MAX_DAILY_TRADES:
+            return
+
+        if self.blocked:
+            return
+
+        # Time gate: no new entries after 14:00 IST
+        try:
+            ct = c.start.time()
+            if ct >= dt_time(14, 0):
+                return
+        except Exception:
+            pass
+
+        # 3. Check trendline rejection (primary secondary signal)
+        tr = self._check_trendline_rejection(c, current_idx)
+        if tr is not None:
+            trade = self._build_trade(
+                c=c,
+                direction=tr["direction"],
+                level_name=tr["level_name"],
+                level_price=tr["level_price"],
+                setup_name=tr["setup_name"],
+                notes=tr["notes"],
+                confluence_bonus=tr.get("confluence_bonus", 0),
+            )
+            if trade:
+                self.active_trade = trade
+                if self.notifier:
+                    self.notifier("ENTRY", trade)
+            return
+
+        # 4. Process zone states (2-candle rule)
+        for i, zs in enumerate(self._zone_states):
+            lvl = zs.level
+            ZONE_TOL = 2.0  # point tolerance for "at level"
+
+            if zs.waiting_confirm:
+                # Candle-2 check: did price reverse back through the level?
+                self._confirm_bars[i] += 1
+                confirmed = False
+                direction = ""
+                if zs.candle1_direction == "UP_BREAK":
+                    # We broke up → expecting reversal DOWN through level (SHORT)
+                    if c.close < lvl.price - ZONE_TOL:
+                        confirmed = True
+                        direction = "SHORT"
+                elif zs.candle1_direction == "DOWN_BREAK":
+                    # We broke down → expecting reversal UP through level (LONG)
+                    if c.close > lvl.price + ZONE_TOL:
+                        confirmed = True
+                        direction = "LONG"
+
+                if confirmed:
+                    # Candle-2 body check: body >= 40% of candle range
+                    body = abs(c.close - c.open)
+                    rng = max(0.1, c.high - c.low)
+                    if body / rng >= 0.40:
+                        bonus = 10 if lvl.tag == "STRONG" else 0
+                        trade = self._build_trade(
+                            c=c,
+                            direction=direction,
+                            level_name=lvl.name,
+                            level_price=lvl.price,
+                            setup_name=f"Zone Reversal ({lvl.name})",
+                            notes=f"2-Candle reversal at {lvl.name} ({lvl.price:.1f}). "
+                                  f"Candle-1 {zs.candle1_direction} → Candle-2 confirms {direction}.",
+                            confluence_bonus=bonus,
+                        )
+                        if trade:
+                            self.active_trade = trade
+                            zs.reset()
+                            self._confirm_bars[i] = 0
+                            if self.notifier:
+                                self.notifier("ENTRY", trade)
+                            return  # take first valid signal only
+                    else:
+                        # Weak body — skip this confirm, keep waiting if not timed out
+                        pass
+
+                # Timeout: if too many bars pass without confirm, reset
+                if self._confirm_bars[i] >= self.CONFIRM_TIMEOUT:
+                    zs.reset()
+                    self._confirm_bars[i] = 0
+                continue  # don't re-arm this zone while waiting
+
+            # Fresh candle-1 detection
+            # UP_BREAK: resistance level — candle closes above
+            if lvl.level_type == "RESISTANCE" and c.close > lvl.price + ZONE_TOL:
+                zs.candle1_close = c.close
+                zs.candle1_time = c.start.isoformat()
+                zs.candle1_direction = "UP_BREAK"
+                zs.waiting_confirm = True
+                self._confirm_bars[i] = 0
+
+            # DOWN_BREAK: support level — candle closes below
+            elif lvl.level_type == "SUPPORT" and c.close < lvl.price - ZONE_TOL:
+                zs.candle1_close = c.close
+                zs.candle1_time = c.start.isoformat()
+                zs.candle1_direction = "DOWN_BREAK"
+                zs.waiting_confirm = True
+                self._confirm_bars[i] = 0
+
+    # ── Trendline Rejection Check ─────────────────────────────────────────────
+
+    def _check_trendline_rejection(self, c: Candle, current_idx: int) -> dict | None:
+        """Check for trendline touch + rejection candle.
+
+        Returns signal dict or None.
+        Resistance TL (from swing highs): price touches from below → close back down (SHORT).
+        Support    TL (from swing lows):  price touches from above → close back up  (LONG).
+        """
+        TOL = 5.0       # points: "touching" the trendline
+        BODY_RATIO = 0.50
+
+        body = abs(c.close - c.open)
+        rng = max(0.1, c.high - c.low)
+
+        # Resistance trendline (from swing highs) → SHORT signal
+        r_tl = self._get_trendline_value(self._swing_highs, current_idx)
+        if r_tl is not None and r_tl > 0:
+            if c.high >= r_tl - TOL and c.close < r_tl and c.close < c.open and (body / rng) >= BODY_RATIO:
+                return {
+                    "direction": "SHORT",
+                    "level_name": "TRENDLINE_HI",
+                    "level_price": round(r_tl, 1),
+                    "setup_name": "Trendline Resistance Rejection",
+                    "notes": f"Price touched resistance TL ({r_tl:.1f}) and closed bearish with {body/rng*100:.0f}% body.",
+                    "confluence_bonus": 5,
+                }
+
+        # Support trendline (from swing lows) → LONG signal
+        s_tl = self._get_trendline_value(self._swing_lows, current_idx)
+        if s_tl is not None and s_tl > 0:
+            if c.low <= s_tl + TOL and c.close > s_tl and c.close > c.open and (body / rng) >= BODY_RATIO:
+                return {
+                    "direction": "LONG",
+                    "level_name": "TRENDLINE_LO",
+                    "level_price": round(s_tl, 1),
+                    "setup_name": "Trendline Support Bounce",
+                    "notes": f"Price touched support TL ({s_tl:.1f}) and closed bullish with {body/rng*100:.0f}% body.",
+                    "confluence_bonus": 5,
+                }
+
+        return None
+
+    # ── Square Off ────────────────────────────────────────────────────────────
+
+    def square_off(self, exit_price: float, exit_time: datetime) -> None:
+        t = self.active_trade
+        if not t or t.status == "CLOSED":
+            return
+        px = exit_price or t.entry_price
+        delta = getattr(t, "delta", 0.65)
+        pts = (px - t.entry_price) if t.direction == "LONG" else (t.entry_price - px)
+        t.realized_r = round(pts / max(1.0, t.risk_pts), 2)
+        t.exit_price = px
+        t.exit_time = exit_time.isoformat()
+        t.exit_reason = "SQUARE_OFF_1510"
+        t.exit_prem = round(t.entry_prem + abs(pts) * delta * (1 if pts >= 0 else -1), 1)
+        t.status = "CLOSED"
+        self.trades.append(t)
+        self._daily_trade_count += 1
+        self.active_trade = None
+        if self.notifier:
+            self.notifier("EXIT", t)
+
+    def get_all_trades(self) -> list[ZoneReversalTrade]:
+        result = list(self.trades)
+        if self.active_trade and self.active_trade not in result:
+            result.append(self.active_trade)
+        return result
 
 
 class UnifiedLiquiditySniper:
@@ -1591,6 +2481,7 @@ class UnifiedLiquiditySniper:
     Combines:
     1. Arm 1: Phase 14 M/W Sweeps at Extremes (PDH / PDL / OI Walls with MSS & Fib Extensions).
     2. Arm 2: Trendline & Golden Pocket Retracements (Intraday Continuations without breaking previous liquidity).
+    3. Arm 3: Clean 2-Candle Liquidity Zone Reversal (PDH/PDL/OI + Trendline rejection) — Production Engine.
     """
     def __init__(
         self,
@@ -1607,26 +2498,86 @@ class UnifiedLiquiditySniper:
         self.today_iso = today_iso or ist_now().date().isoformat()
         self.store = store
         self.isolated = isolated
-        self.notifier = notifier
         self.arm1 = ShadowMWEngine(store=store, today_iso=self.today_iso, isolated=isolated, notifier=notifier)
+        if pdh is not None and pdl is not None and pdh > 0 and pdl > 0:
+            fake_market = type("M", (), {"pdh": pdh, "pdl": pdl, "chain": None})()
+            self.arm1.initialize_levels(fake_market, today_iso=self.today_iso)
         self.arm2 = LiquidityTrendlineFibEngine(pdh=pdh, pdl=pdl, store=store, vah=vah, val=val, poc=poc, notifier=notifier)
+        # Arm 3: Production 2-Candle Liquidity Zone Reversal Engine
+        self.arm3 = LiquidityZoneReversalEngine(pdh=pdh, pdl=pdl, notifier=notifier)
 
-    def on_candle(self, c: Candle, day_state: Any = None, chain: Any = None) -> None:
+    def initialize_levels(self, pdh: float, pdl: float, oi_call_level: float | None = None, oi_put_level: float | None = None) -> None:
+        """Dynamically update/initialize key levels across all arms."""
+        if pdh and pdl and pdh > 0 and pdl > 0:
+            fake_market = type("M", (), {"pdh": pdh, "pdl": pdl, "chain": None})()
+            self.arm1.initialize_levels(fake_market, today_iso=self.today_iso)
+            self.arm2.pdh = pdh
+            self.arm2.pdl = pdl
+            self.arm3.initialize_levels(pdh=pdh, pdl=pdl, oi_call_level=oi_call_level, oi_put_level=oi_put_level)
+
+    def on_candle(self, c: Candle, day_state: Any = None, chain: Any = None, allow_alerts: bool = True) -> None:
         if chain is not None:
             self.arm1.chain_snapshot = chain
             self.arm2.chain_snapshot = chain
-        self.arm1.on_candle(c, spot=c.close, chain=chain, day_state=day_state)
-        self.arm2.on_candle(c, chain_snapshot=chain)
+            self.arm3.chain_snapshot = chain
+
+        orig_notifier1 = self.arm1.notifier
+        orig_notifier2 = self.arm2.notifier
+        orig_notifier3 = self.arm3.notifier
+        if not allow_alerts:
+            self.arm1.notifier = None
+            self.arm2.notifier = None
+            self.arm3.notifier = None
+
+        try:
+            # Enforce single active trade across ALL three arms
+            arm1_has_open = any(t.status in ("OPEN", "PARTIAL_TGT1") for t in self.arm1.trades)
+            arm2_has_open = (self.arm2.active_trade is not None)
+            arm3_has_open = (self.arm3.active_trade is not None)
+
+            any_open = arm1_has_open or arm2_has_open or arm3_has_open
+
+            self.arm1.blocked = arm2_has_open or arm3_has_open
+            self.arm2.blocked = arm1_has_open or arm3_has_open
+            self.arm3.blocked = arm1_has_open or arm2_has_open
+
+            # Process all three arms
+            self.arm1.on_candle(c, spot=c.close, chain=chain, day_state=day_state)
+
+            # Re-check after arm1
+            arm1_has_open_now = any(t.status in ("OPEN", "PARTIAL_TGT1") for t in self.arm1.trades)
+            self.arm2.blocked = arm1_has_open_now or arm3_has_open
+            self.arm3.blocked = arm1_has_open_now or arm2_has_open
+
+            self.arm2.on_candle(c, chain_snapshot=chain)
+
+            # Re-check after arm2
+            arm2_has_open_now = (self.arm2.active_trade is not None)
+            self.arm3.blocked = arm1_has_open_now or arm2_has_open_now
+
+            self.arm3.on_candle(c, chain=chain, day_state=day_state)
+
+            # Persist final blocked states so callers can inspect them
+            arm3_has_open_now = (self.arm3.active_trade is not None)
+            self.arm1.blocked = arm2_has_open_now or arm3_has_open_now
+            self.arm2.blocked = arm1_has_open_now or arm3_has_open_now
+        finally:
+            if not allow_alerts:
+                self.arm1.notifier = orig_notifier1
+                self.arm2.notifier = orig_notifier2
+                self.arm3.notifier = orig_notifier3
 
     def square_off(self, exit_price: float, exit_time: datetime) -> None:
         self.arm1.square_off(exit_price=exit_price, exit_time=exit_time)
         self.arm2.square_off(exit_price=exit_price, exit_time=exit_time)
+        self.arm3.square_off(exit_price=exit_price, exit_time=exit_time)
 
     def get_summary(self) -> dict[str, Any]:
         s1 = self.arm1.get_summary(self.today_iso)
         t1 = [t for t in self.arm1.trades if t.status == "CLOSED"]
         t2 = [t for t in self.arm2.trades if t.status == "CLOSED"]
-        all_closed = t1 + t2
+        t3 = [t for t in self.arm3.trades if t.status == "CLOSED"]
+        all_closed = t1 + t2 + t3
         wins = [t for t in all_closed if t.realized_r > 0]
         losses = [t for t in all_closed if t.realized_r < 0]
         tot_r = sum(t.realized_r for t in all_closed)
@@ -1643,7 +2594,32 @@ class UnifiedLiquiditySniper:
             "arm1_summary": s1,
             "arm2_trades_count": len(t2),
             "arm2_return_r": round(sum(t.realized_r for t in t2), 2),
+            "arm3_trades_count": len(t3),
+            "arm3_return_r": round(sum(t.realized_r for t in t3), 2),
         }
+
+    def get_all_trades(self) -> list[Any]:
+        """Returns all trades (both closed and currently active) across all three arms."""
+        all_tr = list(self.arm1.trades) + list(self.arm2.trades) + list(self.arm3.trades)
+        if getattr(self.arm2, "active_trade", None) and self.arm2.active_trade not in all_tr:
+            all_tr.append(self.arm2.active_trade)
+        if getattr(self.arm3, "active_trade", None) and self.arm3.active_trade not in all_tr:
+            all_tr.append(self.arm3.active_trade)
+        return all_tr
+
+    def get_all_trades_dict(self) -> list[dict[str, Any]]:
+        """Returns JSON-serializable dictionaries of all trades."""
+        res = []
+        for t in self.get_all_trades():
+            if hasattr(t, "to_dict"):
+                res.append(t.to_dict())
+            else:
+                try:
+                    from dataclasses import asdict
+                    res.append(asdict(t))
+                except Exception:
+                    res.append(dict(t.__dict__))
+        return res
 
 
 def compute_fixed_range_volume_profile(

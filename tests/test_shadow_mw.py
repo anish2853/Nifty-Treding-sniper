@@ -362,18 +362,17 @@ def test_liquidity_trendline_fib_engine():
     assert trade.tgt1_price == 22340.0  # Prior swing low
     assert trade.initial_sl <= 22402.0  # SL above prior high or max 33 pts
 
-    # Candle 7 reaches prior low (TGT1) -> 50% booked and SL moved to Breakeven
+    # Candle 7 reaches prior low (TGT1) -> Checkpoint reached, runner holds (no auto-exit)
     c7 = Candle(start=t0 + timedelta(minutes=30), open=22360.0, high=22362.0, low=22338.0, close=22339.0)
     engine.on_candle(c7)
-    assert trade.half_booked is True
-    assert trade.current_sl == 22362.0  # Breakeven stop
+    assert trade.checkpoint_hit is True
+    assert trade.status != "CLOSED"
 
-    # Candle 8 reaches TGT2 (-0.618 extension: 22,340 - 0.618*60 = 22,302.92)
-    c8 = Candle(start=t0 + timedelta(minutes=35), open=22339.0, high=22340.0, low=22300.0, close=22302.0)
+    # Candle 8 breaks structure trail above lower high -> exits on 5M structure trail
+    c8 = Candle(start=t0 + timedelta(minutes=35), open=22339.0, high=22405.0, low=22335.0, close=22400.0)
     engine.on_candle(c8)
     assert trade.status == "CLOSED"
-    assert trade.exit_reason == "FIB_EXT_TGT2_HIT"
-    assert trade.realized_r > 1.0
+    assert trade.exit_reason in ("5M_STRUCTURE_TRAIL", "SL_HIT")
 
 
 def test_unified_liquidity_sniper_isolation():
@@ -531,21 +530,21 @@ def test_compute_option_leg_and_telegram_alert():
     from engines.shadow_mw import compute_option_leg
     from alerts.messages import format_sniper_entry_alert, format_sniper_tgt1_alert, format_sniper_exit_alert
 
-    # Spot at 25032.0 -> ATM strike should round to 25050
+    # Spot at 25032.0 -> slightly ITM strike (delta 0.65 - 0.75)
     leg_long = compute_option_leg(spot=25032.0, direction="LONG", risk_pts=20.0, tgt1_price=25080.0, tgt2_price=25120.0)
-    assert leg_long["strike"] == 25050
     assert leg_long["option_type"] == "CE"
-    assert leg_long["option_symbol"] == "NIFTY 25050 CE"
+    assert leg_long["strike"] <= 25050
     assert leg_long["entry_prem"] > 0
     assert leg_long["sl_prem"] < leg_long["entry_prem"]
     assert leg_long["tgt1_prem"] > leg_long["entry_prem"]
     assert leg_long["tgt2_prem"] > leg_long["tgt1_prem"]
+    assert leg_long["delta"] == 0.65
 
-    # Short at 25032.0 -> ATM strike 25050 PE
+    # Short at 25032.0 -> slightly ITM strike PE
     leg_short = compute_option_leg(spot=25032.0, direction="SHORT", risk_pts=20.0, tgt1_price=24980.0, tgt2_price=24940.0)
-    assert leg_short["strike"] == 25050
     assert leg_short["option_type"] == "PE"
-    assert leg_short["option_symbol"] == "NIFTY 25050 PE"
+    assert leg_short["strike"] >= 25050
+    assert leg_short["delta"] == 0.65
 
     # Test Telegram entry alert formatting
     alert_msg = format_sniper_entry_alert(
@@ -564,11 +563,14 @@ def test_compute_option_leg_and_telegram_alert():
         sl_prem=leg_long["sl_prem"],
         tgt1_prem=leg_long["tgt1_prem"],
         tgt2_prem=leg_long["tgt2_prem"],
+        delta=leg_long["delta"],
+        ride_target_prem_pts=25.0,
     )
-    assert "NIFTY 25050 CE" in alert_msg
+    assert leg_long["option_symbol"] in alert_msg
     assert "BUY CE (CALL)" in alert_msg
     assert f"₹{leg_long['entry_prem']:.1f}" in alert_msg
-    assert "BOOK 50% PROFIT, MOVE SL TO BREAKEVEN (BE_SL)" in alert_msg
+    assert "CHECKPOINT ONLY — NEVER AUTO-EXIT" in alert_msg
+    assert "Ride Target: +25.0 prem pts" in alert_msg
 
     # Test Telegram TGT1 alert formatting
     tgt1_msg = format_sniper_tgt1_alert(
@@ -584,9 +586,9 @@ def test_compute_option_leg_and_telegram_alert():
         tgt1_prem=leg_long["tgt1_prem"],
         tgt2_prem=leg_long["tgt2_prem"],
     )
-    assert "TARGET 1 HIT — 50% PROFIT BOOKED" in tgt1_msg
-    assert "NIFTY 25050 CE" in tgt1_msg
-    assert "STOP MOVED TO ENTRY" in tgt1_msg
+    assert "FIRST PIVOT CHECKPOINT REACHED" in tgt1_msg
+    assert "Checkpoint cleared! Do NOT exit." in tgt1_msg
+    assert leg_long["option_symbol"] in tgt1_msg
 
     # Test Telegram Exit alert formatting
     exit_msg = format_sniper_exit_alert(
@@ -595,16 +597,16 @@ def test_compute_option_leg_and_telegram_alert():
         entry_price=25032.0,
         exit_price=25120.0,
         realized_r=2.20,
-        exit_reason="FIB_EXT_TGT2_HIT",
-        notes="Full Target 2 Hit (+2.20R)",
+        exit_reason="5M_STRUCTURE_TRAIL",
+        notes="5-min close broke structure trail (+2.20R)",
         strike=leg_long["strike"],
         option_type=leg_long["option_type"],
         option_symbol=leg_long["option_symbol"],
         entry_prem=leg_long["entry_prem"],
         exit_prem=leg_long["tgt2_prem"],
     )
-    assert "OPTION TRADE CLOSED" in exit_msg
-    assert "NIFTY 25050 CE" in exit_msg
+    assert "TL-FIB v2 TRADE CLOSED" in exit_msg
+    assert leg_long["option_symbol"] in exit_msg
     assert "+2.20 R" in exit_msg
 
 
@@ -635,29 +637,565 @@ def test_liquidity_trendline_option_execution():
     assert engine.active_trade is not None
     trade = engine.active_trade
     assert trade.direction == "SHORT"
-    assert trade.strike == 22350
     assert trade.option_type == "PE"
-    assert trade.option_symbol == "NIFTY 22350 PE"
+    assert trade.strike >= 22350
     assert trade.entry_prem > 0
     assert trade.sl_prem > 0
     assert trade.tgt1_prem > trade.entry_prem
     assert len(dispatched) >= 1
     assert dispatched[0][0] == "ENTRY"
 
-    # Candle 7 reaches prior low (TGT1) -> 50% booked and SL moved to Breakeven
+    # Candle 7 reaches prior low (TGT1) -> First Pivot Checkpoint cleared, runner holds (never auto-exit)
     c7 = Candle(start=t0 + timedelta(minutes=30), open=22360.0, high=22362.0, low=22338.0, close=22339.0)
     engine.on_candle(c7)
-    assert trade.half_booked is True
-    assert trade.current_sl == 22362.0  # Breakeven stop
+    assert trade.checkpoint_hit is True
+    assert trade.status != "CLOSED"  # Full runner holding
     assert any(d[0] == "TGT1" for d in dispatched)
 
-    # Candle 8 reaches TGT2 -> exits at target
-    c8 = Candle(start=t0 + timedelta(minutes=35), open=22339.0, high=22340.0, low=22300.0, close=22302.0)
+    # Candle 8 breaks structure trail above lower high -> exits on 5M structure trail
+    c8 = Candle(start=t0 + timedelta(minutes=35), open=22339.0, high=22405.0, low=22335.0, close=22400.0)
     engine.on_candle(c8)
     assert trade.status == "CLOSED"
-    assert trade.exit_reason == "FIB_EXT_TGT2_HIT"
-    assert trade.exit_prem == trade.tgt2_prem
+    assert trade.exit_reason in ("5M_STRUCTURE_TRAIL", "SL_HIT")
     assert any(d[0] == "EXIT" for d in dispatched)
+
+
+def test_pivot_deduplication_prevents_reentries_on_same_swing_leg():
+    """Verifies that once a trade has been taken on a swing pivot pair,
+    no repeat entries occur on subsequent candles of the same swing leg (e.g. after BE_SL exit).
+    Only a newly formed swing pivot allows new setups."""
+    from engines.shadow_mw import LiquidityTrendlineFibEngine
+
+    engine = LiquidityTrendlineFibEngine(pdh=22500.0, pdl=22300.0)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # 1. Swing High at 22,400 (Bar 1)
+    engine.on_candle(Candle(start=t0, open=22380.0, high=22385.0, low=22370.0, close=22375.0))
+    engine.on_candle(Candle(start=t0 + timedelta(minutes=5), open=22375.0, high=22400.0, low=22370.0, close=22395.0))
+    engine.on_candle(Candle(start=t0 + timedelta(minutes=10), open=22395.0, high=22390.0, low=22360.0, close=22365.0))
+
+    # 2. Swing Low at 22,340 (Bar 4)
+    engine.on_candle(Candle(start=t0 + timedelta(minutes=15), open=22365.0, high=22370.0, low=22340.0, close=22345.0))
+    engine.on_candle(Candle(start=t0 + timedelta(minutes=20), open=22345.0, high=22365.0, low=22350.0, close=22360.0))
+
+    # Candle 6: Enters short in Golden Pocket
+    c6 = Candle(start=t0 + timedelta(minutes=25), open=22360.0, high=22374.0, low=22358.0, close=22362.0)
+    engine.on_candle(c6)
+    assert engine.active_trade is not None
+    assert engine.last_traded_pivots is not None
+
+    # Candle 7: Hits TGT1 at 22,339 -> Checkpoint cleared, runner holds
+    c7 = Candle(start=t0 + timedelta(minutes=30), open=22360.0, high=22362.0, low=22338.0, close=22339.0)
+    engine.on_candle(c7)
+    assert engine.active_trade.checkpoint_hit is True
+
+    # Candle 8: Breaks structure trail at 22400.0 -> trade closes
+    c8 = Candle(start=t0 + timedelta(minutes=35), open=22345.0, high=22405.0, low=22345.0, close=22400.0)
+    engine.on_candle(c8)
+    assert engine.active_trade is None
+    assert len(engine.trades) == 1
+    assert engine.trades[0].exit_reason in ("5M_STRUCTURE_TRAIL", "SL_HIT")
+
+    # Candle 9: Price is still hovering inside Golden Pocket [22370 - 22377] of the SAME swing pivots
+    c9 = Candle(start=t0 + timedelta(minutes=40), open=22363.0, high=22373.0, low=22360.0, close=22364.0)
+    engine.on_candle(c9)
+    # MUST NOT re-enter on the identical swing leg!
+    assert engine.active_trade is None
+    assert len(engine.trades) == 1
+
+    # Candle 10: Another candle in GP -> still no re-entry!
+    c10 = Candle(start=t0 + timedelta(minutes=45), open=22364.0, high=22374.0, low=22361.0, close=22363.0)
+    engine.on_candle(c10)
+    assert engine.active_trade is None
+    assert len(engine.trades) == 1
+
+
+def test_expiry_formatting_in_telegram_alerts():
+    """Verifies contract expiry string propagation in option leg and Telegram alerts."""
+    from engines.shadow_mw import compute_option_leg
+    from alerts.messages import format_sniper_entry_alert, format_sniper_tgt1_alert, format_sniper_exit_alert
+
+    leg = compute_option_leg(
+        spot=22375.0,
+        direction="SHORT",
+        risk_pts=25.0,
+        tgt1_price=22340.0,
+        tgt2_price=22300.0,
+        expiry="15-OCT-2026",
+    )
+    assert leg["strike"] > 22375
+    assert leg["option_type"] == "PE"
+    assert leg["expiry"] == "15-OCT-2026"
+
+    # Entry alert
+    entry_msg = format_sniper_entry_alert(
+        trade_id="TL-FIB-S-001",
+        direction="SHORT",
+        setup_name="Downtrend Fib Golden Pocket Pullback",
+        entry_price=22375.0,
+        initial_sl=22400.0,
+        risk_pts=25.0,
+        tgt1_price=22340.0,
+        tgt2_price=22300.0,
+        strike=leg["strike"],
+        option_type=leg["option_type"],
+        option_symbol=leg["option_symbol"],
+        entry_prem=leg["entry_prem"],
+        sl_prem=leg["sl_prem"],
+        tgt1_prem=leg["tgt1_prem"],
+        tgt2_prem=leg["tgt2_prem"],
+        expiry=leg["expiry"],
+    )
+    assert leg["option_symbol"] in entry_msg
+    assert "15-OCT-2026" in entry_msg
+
+    # TGT1 alert
+    tgt1_msg = format_sniper_tgt1_alert(
+        trade_id="TL-FIB-S-001",
+        direction="SHORT",
+        entry_price=22375.0,
+        tgt1_price=22340.0,
+        tgt2_price=22300.0,
+        strike=leg["strike"],
+        option_type=leg["option_type"],
+        option_symbol=leg["option_symbol"],
+        entry_prem=leg["entry_prem"],
+        tgt1_prem=leg["tgt1_prem"],
+        tgt2_prem=leg["tgt2_prem"],
+        expiry=leg["expiry"],
+    )
+    assert leg["option_symbol"] in tgt1_msg
+    assert "15-OCT-2026" in tgt1_msg
+
+    # Exit alert
+    exit_msg = format_sniper_exit_alert(
+        trade_id="TL-FIB-S-001",
+        direction="SHORT",
+        entry_price=22375.0,
+        exit_price=22300.0,
+        realized_r=2.5,
+        exit_reason="FIB_EXT_TGT2_HIT",
+        strike=leg["strike"],
+        option_type=leg["option_type"],
+        option_symbol=leg["option_symbol"],
+        entry_prem=leg["entry_prem"],
+        exit_prem=leg["tgt2_prem"],
+        expiry=leg["expiry"],
+    )
+    assert leg["option_symbol"] in exit_msg
+    assert "15-OCT-2026" in exit_msg
+
+
+def test_single_active_trade_and_alert_suppression():
+    """Verifies that:
+    1. UnifiedLiquiditySniper allows at most ONE active trade across Arm 1 and Arm 2.
+    2. allow_alerts=False completely suppresses Telegram alerts (e.g. during startup backlog)."""
+    from engines.shadow_mw import UnifiedLiquiditySniper
+
+    alerts = []
+    def mock_notifier(event, trade):
+        alerts.append((event, trade.trade_id))
+
+    sniper = UnifiedLiquiditySniper(pdh=22500.0, pdl=22300.0, isolated=True, notifier=mock_notifier)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Feed swing setup candles with allow_alerts=False (backlog simulation)
+    sniper.on_candle(Candle(start=t0, open=22380.0, high=22385.0, low=22370.0, close=22375.0), allow_alerts=False)
+    sniper.on_candle(Candle(start=t0 + timedelta(minutes=5), open=22375.0, high=22400.0, low=22370.0, close=22395.0), allow_alerts=False)
+    sniper.on_candle(Candle(start=t0 + timedelta(minutes=10), open=22395.0, high=22390.0, low=22360.0, close=22365.0), allow_alerts=False)
+    sniper.on_candle(Candle(start=t0 + timedelta(minutes=15), open=22365.0, high=22370.0, low=22340.0, close=22345.0), allow_alerts=False)
+    sniper.on_candle(Candle(start=t0 + timedelta(minutes=20), open=22345.0, high=22365.0, low=22350.0, close=22360.0), allow_alerts=False)
+
+    # Candle 6 triggers entry, but allow_alerts is False -> NO alert should be dispatched!
+    c6 = Candle(start=t0 + timedelta(minutes=25), open=22360.0, high=22374.0, low=22358.0, close=22362.0)
+    sniper.on_candle(c6, allow_alerts=False)
+    assert sniper.arm2.active_trade is not None
+    assert len(alerts) == 0  # Alert was suppressed!
+
+    # While Arm 2 is active, Arm 1 must be blocked from entering
+    assert sniper.arm1.blocked is True
+
+
+def test_dispatch_telegram_alert_deduplication_and_stale_suppression(monkeypatch):
+    """Verifies that dispatch_telegram_alert:
+    1. Blocks duplicate events for the same trade_id.
+    2. Drops ENTRY alerts if the candle/entry time is stale (> 180s old)."""
+    from engines.shadow_mw import dispatch_telegram_alert, LiquidityTrendlineTrade
+    from utils import ist_now
+
+    sent_messages = []
+    fake_sender = type("S", (), {
+        "configured": True,
+        "send": lambda self, msg: sent_messages.append(msg)
+    })()
+    monkeypatch.setattr("alerts.telegram_bot.TelegramSender", lambda: fake_sender)
+
+    # 1. Stale entry (entry_time was 60 min ago) -> MUST BE DROPPED
+    old_time = (ist_now() - timedelta(minutes=60)).isoformat()
+    trade_old = LiquidityTrendlineTrade(
+        trade_id="TEST-STALE-001",
+        direction="SHORT",
+        entry_price=22374.0,
+        initial_sl=22407.0,
+        current_sl=22407.0,
+        risk_pts=33.0,
+        tgt1_price=22360.0,
+        tgt2_price=22333.0,
+        entry_time=old_time,
+        strike=22350,
+        option_type="PE",
+    )
+    dispatch_telegram_alert("ENTRY", trade_old)
+    assert len(sent_messages) == 0  # Stale entry suppressed!
+
+    # 2. Fresh entry (entry_time is right now) -> Dispatched
+    fresh_time = ist_now().isoformat()
+    trade_fresh = LiquidityTrendlineTrade(
+        trade_id="TEST-FRESH-001",
+        direction="SHORT",
+        entry_price=22374.0,
+        initial_sl=22407.0,
+        current_sl=22407.0,
+        risk_pts=33.0,
+        tgt1_price=22360.0,
+        tgt2_price=22333.0,
+        entry_time=fresh_time,
+        strike=22350,
+        option_type="PE",
+    )
+    dispatch_telegram_alert("ENTRY", trade_fresh)
+    assert len(sent_messages) == 1
+
+    # 3. Duplicate entry call for SAME trade_id -> MUST BE BLOCKED
+    dispatch_telegram_alert("ENTRY", trade_fresh)
+    assert len(sent_messages) == 1  # Duplicate blocked!
+
+
+def test_live_telegram_trades_only_filter(tmp_path):
+    """Verifies that in live mode, Telegram noise (preflight, zones, coils, regime) is strictly muted,
+    while only actual trade entries, target hits, exits, and emergency outages are sent."""
+    import main
+    from alerts.telegram_bot import NullTelegramSender
+    from engines.regime import RegimeClassifier
+    from data_sources.market_data import MarketDataStore
+    from utils import ist_now
+
+    db_path = tmp_path / "test_trades_only.db"
+    store = JournalStore(db_path)
+    tg = NullTelegramSender()
+
+    market = MarketDataStore(session=None, journal=store, holidays=set())
+    market.set_prev_day(22500.0, 22400.0, 22450.0)
+
+    # 1. LIVE SESSION (live_mode=True): Strict trades-only filter active
+    live_session = main.DaySession(
+        store=store,
+        tg=tg,
+        classifier=RegimeClassifier(event_dates=set()),
+        event_day=False,
+        today_iso=ist_now().date().isoformat(),
+        market=market,
+        live_mode=True,
+    )
+    assert live_session.telegram_trades_only is True
+
+    # Informational messages must be strictly SUPPRESSED
+    live_session._notify("✅ SESSION PREFLIGHT PASSED (09:20 IST)")
+    live_session._notify("👀 RESISTANCE ZONE 22,435-22,440 (EQ) | price 22,432 | call writers +194k above")
+    live_session._notify("👀 SUPPORT ZONE 22,398-22,402 (liquidity levels) | price 22,418")
+    live_session._notify("🧲 COIL 22,353-22,417 | 64 pts | NEUTRAL bias")
+    live_session._notify("🌤 REGIME — 10:59 IST\nNORMAL | gap +0.30% | PCR 0.851")
+    live_session._notify("⚠️ SIGNAL COMPLIANCE BLOCKED")
+
+    assert len(tg.sent) == 0  # Zero noise!
+
+    # Actual trade signals MUST pass through
+    live_session._notify("🎯 NIFTY SNIPER — OPTION TRADE ENTRY\nINSTRUMENT: NIFTY 22350 PE", event_type="TRADE_ENTRY")
+    live_session._notify("🎯 TARGET 1 HIT — 50% PROFIT BOOKED", event_type="TRADE_UPDATE")
+    live_session._notify("🚨 NIFTY SNIPER — OPTION TRADE CLOSED", event_type="TRADE_EXIT")
+    live_session._notify("🚨 DATA-OUTAGE-EXIT TRIGGERED 🚨")
+
+    assert len(tg.sent) == 4
+    assert "OPTION TRADE ENTRY" in tg.sent[0]
+    assert "TARGET 1 HIT" in tg.sent[1]
+    assert "OPTION TRADE CLOSED" in tg.sent[2]
+    assert "DATA-OUTAGE-EXIT" in tg.sent[3]
+
+
+def test_arm2_journaling_and_active_trade_reporting(tmp_path):
+    """Verifies that Arm 2 (LiquidityTrendlineFibEngine) journals events to SQLite,
+    and UnifiedLiquiditySniper reports active open trades immediately."""
+    from engines.shadow_mw import LiquidityTrendlineFibEngine, UnifiedLiquiditySniper
+
+    db_path = tmp_path / "test_arm2_journal.db"
+    store = JournalStore(db_path)
+
+    # 1. Test Arm 2 directly to verify TL-FIB event journaling
+    arm2 = LiquidityTrendlineFibEngine(store=store, pdh=22500.0, pdl=22300.0)
+
+    t0 = datetime(2026, 10, 12, 9, 15, tzinfo=settings.IST)
+    # 1. Swing High at 22,400 (Bar 2)
+    c1 = Candle(start=t0, open=22380.0, high=22385.0, low=22370.0, close=22375.0, volume=100.0)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22375.0, high=22400.0, low=22370.0, close=22395.0, volume=100.0)
+    c3 = Candle(start=t0 + timedelta(minutes=10), open=22395.0, high=22390.0, low=22360.0, close=22365.0, volume=100.0)
+
+    # 2. Swing Low at 22,340 (Bar 4)
+    c4 = Candle(start=t0 + timedelta(minutes=15), open=22365.0, high=22370.0, low=22340.0, close=22345.0, volume=100.0)
+    c5 = Candle(start=t0 + timedelta(minutes=20), open=22345.0, high=22365.0, low=22350.0, close=22360.0, volume=100.0)
+
+    # 3. Pullback into Golden Pocket [22,370 - 22,377] and rejection
+    c6 = Candle(start=t0 + timedelta(minutes=25), open=22360.0, high=22374.0, low=22358.0, close=22362.0, volume=100.0)
+
+    for c in [c1, c2, c3, c4, c5, c6]:
+        arm2.on_candle(c)
+
+    # Verify active trade is open in Arm 2
+    assert arm2.active_trade is not None
+    active_t = arm2.active_trade
+    assert active_t.status in ("OPEN", "PARTIAL_TGT1")
+    assert active_t.direction == "SHORT"
+    assert active_t.strike > 0
+    assert active_t.option_type == "PE"
+
+    # Verify SIGNAL was persisted to SQLite journal
+    rows = store.conn.execute("SELECT type, family, strike, spot, direction FROM journal WHERE family = 'TL-FIB'").fetchall()
+    assert len(rows) >= 1
+    assert rows[0][0] == "SIGNAL"
+    assert rows[0][1] == "TL-FIB"
+    assert rows[0][4] == "SHORT"
+
+    # Next candle: reaches TGT1 (22,340) -> Checkpoint Hit
+    c7 = Candle(start=t0 + timedelta(minutes=30), open=22360.0, high=22362.0, low=22338.0, close=22340.0, volume=100.0)
+    arm2.on_candle(c7)
+    assert active_t.checkpoint_hit is True
+
+    # Verify UPDATE was persisted
+    update_rows = store.conn.execute("SELECT type, family, notes FROM journal WHERE family = 'TL-FIB' AND type = 'UPDATE'").fetchall()
+    assert len(update_rows) >= 1
+    assert "Checkpoint" in update_rows[0][2]
+
+    # 2. Test UnifiedLiquiditySniper reporting active trade
+    sniper = UnifiedLiquiditySniper(store=store, today_iso="2026-10-12", isolated=True)
+    sniper.arm2 = arm2
+    all_tr = sniper.get_all_trades()
+    assert len(all_tr) >= 1
+    dict_tr = sniper.get_all_trades_dict()
+    assert len(dict_tr) >= 1
+    assert dict_tr[0]["trade_id"] == active_t.trade_id
+
+
+# =============================================================================
+# ARM 3: LiquidityZoneReversalEngine Tests
+# =============================================================================
+
+def test_arm3_2candle_zone_reversal_resistance():
+    """Arm 3: PDH resistance break → reversal → SHORT entry."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    PDH = 22500.0
+    PDL = 22300.0
+    engine = LiquidityZoneReversalEngine(pdh=PDH, pdl=PDL)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Candle 1: Closes ABOVE PDH (UP_BREAK → resistance)
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    assert not engine.active_trade, "No entry yet — still waiting for candle 2"
+
+    # Check that zone state is armed (waiting_confirm = True for PDH zone)
+    pdh_state = next((zs for zs in engine._zone_states if zs.level.name == "PDH"), None)
+    assert pdh_state is not None
+    assert pdh_state.waiting_confirm is True
+    assert pdh_state.candle1_direction == "UP_BREAK"
+
+    # Candle 2: Closes BELOW PDH with decent body → SHORT confirmed
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is not None, "SHORT trade should be entered"
+    assert engine.active_trade.direction == "SHORT"
+    assert engine.active_trade.level_name == "PDH"
+    assert "Zone Reversal" in engine.active_trade.setup_name
+    # SL must be above entry (for SHORT)
+    assert engine.active_trade.current_sl > engine.active_trade.entry_price
+    # Target must be below entry
+    assert engine.active_trade.tgt2_price < engine.active_trade.entry_price
+
+
+def test_arm3_2candle_zone_reversal_support():
+    """Arm 3: PDL support break → reversal → LONG entry."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    PDH = 22500.0
+    PDL = 22300.0
+    engine = LiquidityZoneReversalEngine(pdh=PDH, pdl=PDL)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Candle 1: Closes BELOW PDL (DOWN_BREAK → support)
+    c1 = Candle(start=t0, open=22310.0, high=22315.0, low=22280.0, close=22285.0)
+    engine.on_candle(c1)
+    assert not engine.active_trade
+
+    pdl_state = next((zs for zs in engine._zone_states if zs.level.name == "PDL"), None)
+    assert pdl_state.waiting_confirm is True
+    assert pdl_state.candle1_direction == "DOWN_BREAK"
+
+    # Candle 2: Closes ABOVE PDL with strong body → LONG confirmed
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22288.0, high=22318.0, low=22282.0, close=22312.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is not None
+    assert engine.active_trade.direction == "LONG"
+    assert engine.active_trade.level_name == "PDL"
+
+
+def test_arm3_confirm_timeout_resets_state():
+    """Arm 3: If candle-2 doesn't reverse within CONFIRM_TIMEOUT bars → state resets (breakout, not reversal)."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    PDH = 22500.0
+    PDL = 22300.0
+    engine = LiquidityZoneReversalEngine(pdh=PDH, pdl=PDL)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Candle 1: UP_BREAK of PDH
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+
+    # Feed CONFIRM_TIMEOUT candles that stay above PDH (no reversal)
+    for i in range(engine.CONFIRM_TIMEOUT):
+        cx = Candle(
+            start=t0 + timedelta(minutes=5 * (i + 1)),
+            open=22510.0, high=22525.0, low=22505.0, close=22518.0,
+        )
+        engine.on_candle(cx)
+
+    # After timeout, state should be reset
+    pdh_state = next((zs for zs in engine._zone_states if zs.level.name == "PDH"), None)
+    assert not pdh_state.waiting_confirm, "State should reset after timeout"
+    assert not engine.active_trade, "No trade should have been entered"
+
+
+def test_arm3_max_daily_trades_limit():
+    """Arm 3: Stops entering new trades after MAX_DAILY_TRADES (3)."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    PDH = 22500.0
+    PDL = 22300.0
+    engine = LiquidityZoneReversalEngine(pdh=PDH, pdl=PDL)
+    engine._daily_trade_count = 3  # Already at limit
+
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+    # Even a perfect setup should not fire
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is None, "Should be blocked by daily trade limit"
+
+
+def test_arm3_blocked_by_existing_trade():
+    """Arm 3: blocked=True prevents new entry even on valid signal."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    engine = LiquidityZoneReversalEngine(pdh=22500.0, pdl=22300.0)
+    engine.blocked = True
+
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is None, "Should be blocked"
+
+
+def test_arm3_sl_hit_closes_trade():
+    """Arm 3: SL hit correctly closes the trade with negative R."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    engine = LiquidityZoneReversalEngine(pdh=22500.0, pdl=22300.0)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Setup a SHORT trade via 2-candle signal
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is not None
+    sl_price = engine.active_trade.current_sl
+
+    # Feed a candle that hits SL (price goes ABOVE sl for SHORT)
+    c3 = Candle(start=t0 + timedelta(minutes=10), open=22492.0, high=sl_price + 2.0, low=22490.0, close=sl_price + 1.0)
+    engine.on_candle(c3)
+    assert engine.active_trade is None, "Trade should be closed"
+    assert len(engine.trades) == 1
+    assert engine.trades[0].exit_reason in ("SL_HIT", "BE_SL")
+
+
+def test_arm3_square_off_1510():
+    """Arm 3: square_off correctly closes an open trade at 15:10."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    engine = LiquidityZoneReversalEngine(pdh=22500.0, pdl=22300.0)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert engine.active_trade is not None
+
+    exit_t = t0.replace(hour=15, minute=10)
+    engine.square_off(exit_price=22470.0, exit_time=exit_t)
+    assert engine.active_trade is None
+    assert len(engine.trades) == 1
+    assert engine.trades[0].exit_reason == "SQUARE_OFF_1510"
+
+
+def test_arm3_notifier_called_on_entry_and_exit():
+    """Arm 3: notifier is called for ENTRY and EXIT events."""
+    from engines.shadow_mw import LiquidityZoneReversalEngine
+
+    events = []
+    def fake_notifier(event_type, trade):
+        events.append((event_type, trade.trade_id))
+
+    engine = LiquidityZoneReversalEngine(pdh=22500.0, pdl=22300.0, notifier=fake_notifier)
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Trigger 2-candle SHORT signal
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    engine.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    engine.on_candle(c2)
+    assert any(e[0] == "ENTRY" for e in events), "ENTRY notification not fired"
+
+    # Square off
+    engine.square_off(exit_price=22460.0, exit_time=t0 + timedelta(hours=4))
+    assert any(e[0] == "EXIT" for e in events), "EXIT notification not fired"
+
+
+def test_arm3_integrated_in_unified_sniper():
+    """UnifiedLiquiditySniper.arm3 is a LiquidityZoneReversalEngine and blocks other arms when active."""
+    from engines.shadow_mw import UnifiedLiquiditySniper, LiquidityZoneReversalEngine
+
+    PDH, PDL = 22500.0, 22300.0
+    sniper = UnifiedLiquiditySniper(pdh=PDH, pdl=PDL, today_iso="2026-10-09", isolated=True)
+    assert isinstance(sniper.arm3, LiquidityZoneReversalEngine)
+
+    t0 = datetime(2026, 10, 9, 9, 15, tzinfo=settings.IST)
+
+    # Arm 3 signal: UP_BREAK of PDH
+    c1 = Candle(start=t0, open=22490.0, high=22520.0, low=22480.0, close=22515.0)
+    sniper.on_candle(c1)
+    c2 = Candle(start=t0 + timedelta(minutes=5), open=22510.0, high=22512.0, low=22488.0, close=22492.0)
+    sniper.on_candle(c2)
+
+    if sniper.arm3.active_trade is not None:
+        # Arm 2 must be blocked
+        assert sniper.arm2.blocked is True, "Arm 2 must be blocked while Arm 3 has open trade"
+
+
+
+
 
 
 

@@ -91,3 +91,29 @@ def test_get_forward_progress_data():
     assert res["real_money_gate"] == "BLOCKED"
     assert res["system_status"] == "PAPER ONLY"
     assert res["config_version"] == "FROZEN-v1"
+
+
+def test_dashboard_historical_backtest_data():
+    """Verify that get_historical_backtest_data loads all 189 sessions with both arms."""
+    from dashboard.app import get_historical_backtest_data
+    df = get_historical_backtest_data()
+    assert not df.empty
+    assert len(df) >= 200
+    expected_cols = ["Date", "Time", "Trade ID", "Arm", "Direction", "Instrument", "Spot Entry", "Spot SL", "Spot Exit", "Buy Prem", "SL Prem", "Exit Prem", "Realized R", "Outcome", "Exit Reason", "Setup", "Notes"]
+    for col in expected_cols:
+        assert col in df.columns
+
+    # Verify both Arms are present and firing
+    arm1_trades = df[df["Arm"].str.contains("Arm 1")]
+    arm2_trades = df[df["Arm"].str.contains("Arm 2")]
+    assert len(arm1_trades) > 50, f"Expected Arm 1 sweeps > 50, got {len(arm1_trades)}"
+    assert len(arm2_trades) > 50, f"Expected Arm 2 TL-FIB > 50, got {len(arm2_trades)}"
+
+    # Verify overall performance
+    total_trades = len(df)
+    wins = len(df[df["Realized R"] > 0])
+    win_rate = wins / total_trades * 100.0
+    total_r = df["Realized R"].sum()
+    assert win_rate >= 60.0, f"Expected win rate >= 60%, got {win_rate:.1f}%"
+    assert total_r > 80.0, f"Expected total R > +80R, got {total_r:.2f}R"
+

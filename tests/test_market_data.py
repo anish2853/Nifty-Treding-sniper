@@ -74,6 +74,7 @@ def test_one_refresh_one_consistent_set(store, monkeypatch):
     """Spec #1/#7: one refresh fills spot, chain, VIX with the SAME timestamp and
     provenance; the footer shows the stored set."""
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["records"]["expiryDates"] = ["06-Oct-2026", "13-Oct-2026", "20-Oct-2026", "27-Oct-2026"]
     monkeypatch.setattr("data_sources.market_data.fetch_option_chain_with_retries",
                         lambda session: (raw, 200, [("/api/option-chain-v3", 200)]))
     monkeypatch.setattr("data_sources.market_data.india_vix",

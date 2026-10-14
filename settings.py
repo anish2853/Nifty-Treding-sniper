@@ -253,6 +253,7 @@ INDIA_VIX_URL = "https://www.moneycontrol.com/indian-indices/India-VIX-36.html"
 # --- Telegram ---
 TELEGRAM_TIMEOUT_SEC = 10
 TELEGRAM_RETRIES = 3                  # retry 3x, then log and continue (never crash)
+TELEGRAM_TRADES_ONLY = os.getenv("TELEGRAM_TRADES_ONLY", "false").lower() in ("true", "1", "yes")
 
 # --- Watchdog / resilience (daily-worker spec) ---
 WATCHDOG_RESTART_LIMIT = 5            # max in-process restarts per day, then shutdown
