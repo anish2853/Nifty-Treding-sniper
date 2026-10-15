@@ -81,12 +81,13 @@ def build_liquidity_sniper_chart(
         session_start = datetime(session_date.year, session_date.month, session_date.day, 9, 10)
         session_end = datetime(session_date.year, session_date.month, session_date.day, 15, 35)
         view_start = session_start
-        if len(candles) <= 12:  # First hour: comfortable 2.5h window
-            view_end = datetime(session_date.year, session_date.month, session_date.day, 11, 45)
-        elif len(candles) <= 30:  # Mid-morning: up to 13:30
-            view_end = datetime(session_date.year, session_date.month, session_date.day, 13, 30)
-        else:
+        if len(candles) >= 70:
             view_end = session_end
+        else:
+            latest_dt = x_candles[-1]
+            min_view = datetime(session_date.year, session_date.month, session_date.day, 11, 45)
+            forward_view = latest_dt + timedelta(minutes=45)
+            view_end = min(session_end, max(min_view, forward_view))
     else:
         session_start = x_candles[0] - timedelta(minutes=5)
         session_end = x_candles[-1] + timedelta(minutes=5)

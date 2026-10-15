@@ -130,7 +130,7 @@ class StatsCalculator:
 
     def _load_trades(self):
         """Load ONE run_id from replay journal; abort if duplicates exist."""
-        conn = sqlite3.connect(f"file:{self.replay_db_path}?immutable=1", uri=True)
+        conn = sqlite3.connect(f"file:{self.replay_db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             self.integrity = verify_run_integrity(conn, self.run_id)

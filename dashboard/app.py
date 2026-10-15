@@ -72,10 +72,10 @@ st.set_page_config(
 
 
 class ReadOnlyJournal:
-    """Read-only view of the SQLite journal using immutable mode (SAFETY)."""
+    """Read-only view of the SQLite journal in read-only WAL mode (SAFETY & LIVE SYNC)."""
 
     def __init__(self, db_path: str | Path):
-        uri = Path(db_path).resolve().as_uri() + "?immutable=1"
+        uri = Path(db_path).resolve().as_uri() + "?mode=ro"
         self._ro = sqlite3.connect(uri, uri=True)
 
     @property
@@ -667,6 +667,21 @@ def render_live_body(selected_date: str, available_dates: list[str], chart_heigh
     # ---- 1. HEADER & TOP KPI BAR (GROUND TRUTH) ----
     st.title("🎯 Nifty Sniper — Live Trading Dashboard")
     st.caption("Unified Institutional Liquidity Sniper — Arm 1 (M/W Sweeps) + Arm 2 (TL-FIB v2) | One Brain Consolidated")
+
+    # Live Status & Refresh Strip
+    now_str = ist_now().strftime("%H:%M:%S IST")
+    latest_candle_str = candles[-1].start.strftime("%H:%M IST") if candles else "None"
+    
+    col_stat, col_btn = st.columns([5, 1])
+    with col_stat:
+        st.markdown(
+            f"🟢 **LIVE ENGINE CONNECTED** &nbsp;|&nbsp; ⏱️ **Time:** `{now_str}` &nbsp;|&nbsp; "
+            f"🕯️ **Latest Synced Candle:** `{latest_candle_str}` ({len(candles)} bars) &nbsp;|&nbsp; "
+            f"⚡ Auto-refreshing every 60s"
+        )
+    with col_btn:
+        if st.button("🔄 Refresh Now", key="btn_top_refresh", help="Click to immediately reload latest candles and chart"):
+            st.rerun()
 
     # Data Completeness & Continuity Check (Phase 14)
     today_real = ist_now().date().isoformat()
