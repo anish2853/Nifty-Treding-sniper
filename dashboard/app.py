@@ -225,10 +225,21 @@ def load_journal_trades_for_session(
     Eliminates rogue in-memory simulation to guarantee:
     Journal Trades == Telegram Alerts == Dashboard Trades (Single Trade Book).
     """
-    if not pdh and candles:
-        pdh = max(c.high for c in candles[:15]) if len(candles) >= 15 else candles[0].high
-    if not pdl and candles:
-        pdl = min(c.low for c in candles[:15]) if len(candles) >= 15 else candles[0].low
+    # If PDH/PDL was not passed from prev session, look up preceding session candles from DB
+    if (pdh is None or pdl is None) and target_date_iso:
+        try:
+            prev_row = store.conn.execute(
+                "SELECT MAX(high), MIN(low) FROM candles WHERE substr(start, 1, 10) < ? "
+                "AND substr(start, 1, 10) = (SELECT MAX(substr(start, 1, 10)) FROM candles WHERE substr(start, 1, 10) < ?)",
+                (target_date_iso, target_date_iso),
+            ).fetchone()
+            if prev_row and prev_row[0] is not None:
+                if pdh is None:
+                    pdh = round(float(prev_row[0]), 2)
+                if pdl is None:
+                    pdl = round(float(prev_row[1]), 2)
+        except Exception as exc:
+            log.warning("Could not query prior session PDH/PDL from database: %s", exc)
 
     # Intraday trend & trendline geometry strictly for chart visualization
     trend = "RANGE"
@@ -457,8 +468,11 @@ def load_journal_trades_for_session(
         })
 
     # If no journal rows existed (e.g. historical archive date from 2026 dataset),
-    # compute trades via the unified liquidity sniper engine for historical inspection
-    if not formatted_trades and candles and len(candles) >= 10:
+    # compute trades via the unified liquidity sniper engine for historical inspection.
+    # INVARIANT: FOR TODAY (LIVE MARKET), NEVER SIMULATE FAKE TRADES!
+    # The live bot (main.py) is the sole trade authority. If 0 trades fired in real market, show 0 trades.
+    today_real = ist_now().date().isoformat()
+    if target_date_iso != today_real and not formatted_trades and candles and len(candles) >= 10:
         try:
             sniper_replay = UnifiedLiquiditySniper(
                 today_iso=target_date_iso, pdh=pdh, pdl=pdl, isolated=True, vah=vah, val=val, poc=poc
@@ -652,15 +666,18 @@ def render_live_body(selected_date: str, available_dates: list[str], chart_heigh
         pass
 
     vah, val, poc = None, None, None
+    pdh, pdl = None, None
     if prev_date:
         prev_candles = load_candles_for_session(store, prev_date)
         if prev_candles:
+            pdh = round(max(c.high for c in prev_candles), 2)
+            pdl = round(min(c.low for c in prev_candles), 2)
             from engines.shadow_mw import compute_fixed_range_volume_profile
             frvp_res = compute_fixed_range_volume_profile(prev_candles)
             vah, val, poc = frvp_res["vah"], frvp_res["val"], frvp_res["poc"]
 
     formatted_trades, summary = load_journal_trades_for_session(
-        store, selected_date, candles, vah=vah, val=val, poc=poc
+        store, selected_date, candles, pdh=pdh, pdl=pdl, vah=vah, val=val, poc=poc
     )
     store.close()
 
