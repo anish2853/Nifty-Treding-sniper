@@ -165,13 +165,30 @@ def build_liquidity_sniper_chart(
             font=dict(size=10, color="#26c6da"),
         )
 
-    # 2b. Phase 15 STRONG Liquidity Zones (10-30 pts, drawn, labeled, STRONG-tagged)
+    # 2b. Phase 15 STRONG Liquidity Zones: Only include zones within proximate trading range
+    # to avoid blowing out the Y-axis (which flattens the 5m candles into invisible lines)
+    min_candle_low = min(c.low for c in candles)
+    max_candle_high = max(c.high for c in candles)
+    prox_padding = max(100.0, (max_candle_high - min_candle_low) * 0.40)
+    visible_y_min = min_candle_low - prox_padding
+    visible_y_max = max_candle_high + prox_padding
+
+    # Expand slightly for key reference levels if they are reasonably close (< 250 pts)
+    for ref_level in [pdh, pdl, vah, val, poc]:
+        if ref_level and ref_level > 0 and abs(ref_level - ((min_candle_low + max_candle_high) / 2)) <= 350.0:
+            visible_y_min = min(visible_y_min, ref_level - 20.0)
+            visible_y_max = max(visible_y_max, ref_level + 20.0)
+
     if zones:
         for z in zones:
             z_low = float(z.get("zone_low", 0.0))
             z_high = float(z.get("zone_high", 0.0))
             if z_low <= 0 or z_high <= 0:
                 continue
+            # Only draw zones that are near the active trading action
+            if z_high < visible_y_min or z_low > visible_y_max:
+                continue
+
             z_type = z.get("zone_type", "SUPPORT")
             k = z.get("anchor_strike", int((z_low + z_high) / 2))
             is_sup = (z_type == "SUPPORT")
@@ -412,5 +429,9 @@ def build_liquidity_sniper_chart(
     fig.update_xaxes(
         range=[view_start, view_end],
         rangeslider_visible=False,
+    )
+    fig.update_yaxes(
+        range=[visible_y_min, visible_y_max],
+        autorange=False,
     )
     return fig
