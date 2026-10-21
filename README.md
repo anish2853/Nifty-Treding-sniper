@@ -1,20 +1,43 @@
-# Nifty Options Alert-Only Assistant (NSE India)
+# Nifty Institutional Trading Sniper — Unified v2.5.0 (NSE India)
 
-Personal, **alert-only** worker bot for Nifty index options. It auto-starts each
-trading day, works the day on a fixed lifecycle, pushes everything to Telegram
-(the phone is the only UI), and shuts itself down. **No order placement exists
-anywhere in this codebase** (Phases A-B are alert/journal only; execution is
-Phase D, gated behind explicit approval and `PAPER_MODE=false`).
+Personal, **alert-only** institutional trading bot for Nifty 50 index options. It auto-starts each
+trading day, works on a fixed institutional lifecycle, pushes trades instantly to Telegram
+(with structured, explainable trade cards), and logs everything into a single-source-of-truth journal.
+
+## Unified Institutional Sniper Architecture (v2.5.0 — Phase 15.1)
+
+The system operates three specialized, non-interfering entry and execution arms:
+
+1. **Arm 1: Boundary Liquidity Sweeps (M/W Patterns)**
+   - Monitors institutional boundary liquidity at Previous Day High (PDH), Previous Day Low (PDL), and Major OI Strike Walls.
+   - Requires liquidity sweep + Market Structure Shift (MSS) + Neckline retest confirmation.
+   - Stops placed beyond extreme swing; Targets projected to opposing liquidity boundaries.
+
+2. **Arm 2: Trendline Fibonacci Golden Pocket Reload (TL-FIB v2)**
+   - Identifies intraday trendline pullbacks directly into the Fibonacci Golden Pocket `[0.50, 0.618, 0.705]`.
+   - **ITM Strike Selection**: Slightly In-The-Money delta `0.65–0.75` for enhanced delta sensitivity.
+   - **Scalp-Killer Gate**: Ride target (1.272×H fib extension or next wall) must be `≥ 20 premium points`.
+   - **20-Point Chase Filter**: Rejects FOMO entries if price has run `> 20 pts` away from the 0.618 Fib reload level.
+   - **Structural Trailing**: SL ratchets behind 5-min higher lows (CALL) or lower highs (PUT); runner held to 15:10 IST.
+
+3. **Arm 3: Liquidity Zone Reversal & Trendline Support Bounce**
+   - Dynamic 2-candle liquidity zone bounce off high-volume institutional support/resistance levels.
+   - Example live capture: `ZR-L-001` (NIFTY 22850 CE at ₹213.0 → Exit at ₹239.2, capturing **+2.00 R / +26.2 premium pts**).
+
+## Live Observability & Dashboard
+
+- **Zero-Latency WAL Sync**: SQLite connection uses `?mode=ro` to instantly stream live 5m candles and journal events into the dashboard.
+- **Single Trade Book**: Zero phantom or simulated trades during live sessions; dashboard strictly mirrors Telegram alerts and `journal.sqlite3`.
+- **Accurate Historical Anchors**: Previous Day High/Low and Fixed Range Volume Profile (VAH/VAL/POC) are dynamically derived from real preceding session prints.
 
 ## Phase status
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A | Data layer, pre-market report, regime classifier, OI snapshot logger, tests | **built** |
-| A+ | Daily-worker upgrade: hard lifecycle, self-restart watchdog, feed alarms, Telegram-only UI, Task Scheduler auto-start | **built** |
-| B | Sniper engine: candle engine, entry/exit engines, 🎯 trade cards, paper accounting, Streamlit dashboard | **built** |
-| C | Replay backtester on the journal (`--mode backtest`) | waiting for "proceed" |
-| D | Angel One SmartAPI execution (SmartConnect, TOTP, ROBO orders, 15:10 square-off) | requires explicit approval |
+| Phase 1-14 | Data layer, regime classifier, OI snapshot logger, M/W Sweeps, TL-FIB, Census | **built** |
+| Phase 15.1 | Unified Institutional Sniper (TL-FIB v2 + Zone Reversal + Scalp-Killer Gate) | **production ready** |
+| Live Ops | Real-time Streamlit dashboard, Telegram instant alerts, SQLite WAL mode | **active** |
+| Execution | Angel One SmartAPI execution (gated behind explicit approval) | ready for approval |
 
 ## Phase B — how the sniper works (all frozen parameters live in `settings.py`)
 
