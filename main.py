@@ -324,7 +324,6 @@ class DaySession:
         print_and_export_census()
 
         from engines.shadow_mw import ShadowMWEngine, UnifiedLiquiditySniper, dispatch_telegram_alert
-        self.shadow_mw = ShadowMWEngine(store=self.store, today_iso=self.today_iso)
         self.sniper = UnifiedLiquiditySniper(
             store=self.store,
             today_iso=self.today_iso,
@@ -332,6 +331,7 @@ class DaySession:
             pdl=self.market.pdl,
             notifier=dispatch_telegram_alert,
         )
+        self.shadow_mw = self.sniper.arm1
 
         # Phase 15: Zone-Ride Model Engine (The Consolidated Final Spec)
         from engines.zone_ride import ZoneRideEngine
@@ -695,11 +695,9 @@ class DaySession:
             pdh=self.market.pdh, pdl=self.market.pdl)
 
         # Shadow Arm & Model A Sniper level set initialization (09:15 daily)
-        if not self.shadow_mw.levels_initialized or not self.shadow_mw.levels:
-            self.shadow_mw.initialize_levels(self.market, self.today_iso)
-            if hasattr(self, "sniper"):
-                self.sniper.arm1.levels = list(self.shadow_mw.levels)
-                self.sniper.arm1.levels_initialized = True
+        if hasattr(self, "sniper"):
+            if not getattr(self.sniper.arm1, "levels_initialized", False) or not self.sniper.arm1.levels:
+                self.sniper.initialize_levels(pdh=self.market.pdh, pdl=self.market.pdl)
 
         # Build Canonical MarketSnapshot for Phase 1-10 Pipeline
         self.current_snapshot = self.snapshot_builder.build(self.market, now)
@@ -766,7 +764,6 @@ class DaySession:
             if self.first_cycle:
                 # Startup catch-up backlog: sync internal state silently without spamming alerts
                 for c in fresh:
-                    self.shadow_mw.on_candle(c, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
                     if hasattr(self, "sniper"):
                         self.sniper.on_candle(c, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=False)
                 log.info("STALE backlog processed silently: %d candle(s) at startup (alerts suppressed)", len(fresh))
@@ -776,7 +773,6 @@ class DaySession:
             else:
                 # Process any superseded older candles silently
                 for stale in fresh[:-1]:
-                    self.shadow_mw.on_candle(stale, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
                     if hasattr(self, "sniper"):
                         self.sniper.on_candle(stale, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=False)
                     log.info("STALE superseded candle processed silently: %s", stale.start.isoformat(timespec="seconds"))
@@ -786,7 +782,6 @@ class DaySession:
                 age = (ist_now() - candidate.end).total_seconds()
                 is_fresh = (age <= settings.STALE_CANDLE_MAX_AGE_SEC)
 
-                self.shadow_mw.on_candle(candidate, spot=self.market.spot_value(), chain=self.market.chain, now=now, day_state=self.day_state)
                 if hasattr(self, "sniper"):
                     self.sniper.on_candle(candidate, day_state=self.day_state, chain=getattr(self.market, "chain", None), allow_alerts=is_fresh)
 

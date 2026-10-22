@@ -513,10 +513,11 @@ def format_sniper_entry_alert(
     tgt2_prem_txt = f"₹{tgt2_prem:.1f}" if tgt2_prem > 0 else "—"
     capital_txt = f"₹{entry_prem * lot_size:,.0f}" if entry_prem > 0 else "—"
 
-    fib_lo = min(fib_50, fib_618, fib_705) if fib_50 > 0 else 0.0
-    fib_hi = max(fib_50, fib_618, fib_705) if fib_50 > 0 else 0.0
+    valid_fibs = [f for f in (fib_50, fib_618, fib_705) if f and f > 0]
+    fib_lo = min(valid_fibs) if valid_fibs else 0.0
+    fib_hi = max(valid_fibs) if valid_fibs else 0.0
     bonus_str = " 🔥 [OI Zone Confluence +10]" if confluence_bonus else ""
-    fib_txt = f"• Golden Pocket: [{fib_lo:.1f} – {fib_hi:.1f}]{bonus_str}\n" if fib_50 > 0 else ""
+    fib_txt = f"• Golden Pocket: [{fib_lo:.1f} – {fib_hi:.1f}]{bonus_str}\n" if (fib_lo > 0 and fib_hi > 0) else ""
     delta_val = delta if delta > 0 else 0.65
     delta_txt = f"• Strike Delta: {delta_val:.2f} (Slightly ITM)\n"
 

@@ -116,6 +116,7 @@ class ShadowMWTrade:
     # Fibonacci Levels
     fib_50: float = 0.0
     fib_618: float = 0.0
+    fib_705: float = 0.0
     fib_target_272: float = 0.0
     fib_target_618: float = 0.0
     # EMA / VWAP gates experiment measurement
@@ -178,11 +179,20 @@ class ShadowMWEngine:
         try:
             with open(self.data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.trades = [ShadowMWTrade(**t) for t in data.get("trades", [])]
-            self.candidates = [MWPatternCandidate(**c) for c in data.get("candidates", [])]
-            self.levels = [MWLevel(**lvl) for lvl in data.get("levels", [])]
-            if self.levels:
-                self.levels_initialized = True
+            file_today = data.get("today_iso")
+            if file_today == self.today_iso:
+                self.trades = [ShadowMWTrade(**t) for t in data.get("trades", [])]
+                self.candidates = [MWPatternCandidate(**c) for c in data.get("candidates", [])]
+                self.levels = [MWLevel(**lvl) for lvl in data.get("levels", [])]
+                if self.levels:
+                    self.levels_initialized = True
+            else:
+                # Prior day data: only keep closed historical trades for running stats;
+                # NEVER load stale levels or active candidates from previous sessions!
+                self.trades = [ShadowMWTrade(**t) for t in data.get("trades", []) if t.get("status") == "CLOSED"]
+                self.candidates = []
+                self.levels = []
+                self.levels_initialized = False
         except Exception as exc:
             log.warning("Could not load shadow MW ledger: %s", exc)
 
@@ -792,6 +802,12 @@ class ShadowMWEngine:
         if any(t.status in ("OPEN", "PARTIAL_TGT1") for t in self.trades):
             return
 
+        # TIME GATE: Strict institutional entry cutoff
+        # No new entries after 14:00 IST (avoids late-session chop and EOD theta crush; 15:10 is square-off)
+        if candle.start.time() >= dt_time(14, 0):
+            log.info("[SHADOW-MW] Entry blocked by TIME GATE (candle %s >= 14:00 IST)", candle.start.strftime("%H:%M"))
+            return
+
         entry_price = candle.close
         trade_num = len(self.trades) + 1
         trade_id = f"SMW-{trade_num:03d}"
@@ -863,6 +879,7 @@ class ShadowMWEngine:
             entry_time=candle.start.isoformat(),
             fib_50=candidate.fib_50,
             fib_618=candidate.fib_618,
+            fib_705=getattr(candidate, "fib_705", 0.0),
             fib_target_272=candidate.fib_target_272,
             fib_target_618=candidate.fib_target_618,
             ema20_at_entry=ema20,
@@ -1365,7 +1382,9 @@ class LiquidityTrendlineFibEngine:
         except Exception as exc:
             log.warning("Could not journal trendline fib trade event: %s", exc)
 
-    def on_candle(self, c: Candle, chain_snapshot: Any = None) -> list[LiquidityTrendlineTrade]:
+    def on_candle(self, c: Candle, day_state: Any = None, chain_snapshot: Any = None) -> list[LiquidityTrendlineTrade]:
+        if day_state is not None:
+            self.day_state = day_state
         if chain_snapshot is not None:
             self.chain_snapshot = chain_snapshot
         self.candles.append(c)
@@ -1557,11 +1576,21 @@ class LiquidityTrendlineFibEngine:
         """Determines active intraday trend: 'DOWNTREND', 'UPTREND', or 'RANGE'.
         
         Evaluates:
-        1. Swing pivot structure: lower highs & lower lows vs higher highs & higher lows.
-        2. Session open price relation.
+        1. Master DayState authoritative alignment (if provided by live engine).
+        2. Swing pivot structure: lower highs & lower lows vs higher highs & higher lows.
+        3. Session open price relation.
         """
         if not self.candles:
             return "RANGE"
+
+        # 1. Master DayState authoritative alignment
+        if getattr(self, "day_state", None):
+            ds_state = getattr(self.day_state, "state", "")
+            ds_bias = getattr(self.day_state, "bias", "")
+            if ds_state == "TREND-UP" or "CE" in ds_bias:
+                return "UPTREND"
+            if ds_state == "TREND-DOWN" or "PE" in ds_bias:
+                return "DOWNTREND"
 
         day_open = self.candles[0].open
         curr_c = self.candles[-1]
@@ -2549,7 +2578,7 @@ class UnifiedLiquiditySniper:
             self.arm2.blocked = arm1_has_open_now or arm3_has_open
             self.arm3.blocked = arm1_has_open_now or arm2_has_open
 
-            self.arm2.on_candle(c, chain_snapshot=chain)
+            self.arm2.on_candle(c, day_state=day_state, chain_snapshot=chain)
 
             # Re-check after arm2
             arm2_has_open_now = (self.arm2.active_trade is not None)
