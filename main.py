@@ -86,6 +86,26 @@ def wait_until(target) -> None:
         time.sleep((wake - now).total_seconds())
 
 
+def prevent_system_sleep() -> None:
+    """Prevent Windows OS from entering sleep or Modern Standby during trading session."""
+    try:
+        import ctypes
+        res = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        log.info("Power lock engaged: Windows sleep/standby prevented during live market (code: %s)", res)
+    except Exception as exc:
+        log.warning("Could not set Windows execution state for sleep prevention: %s", exc)
+
+
+def allow_system_sleep() -> None:
+    """Restore normal Windows OS sleep/standby behavior upon shutdown."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+        log.info("Power lock released: normal Windows sleep/standby behavior restored")
+    except Exception:
+        pass
+
+
 def round_to_strike(spot: float) -> int:
     step = settings.STRIKE_ROUND_TO
     return int(round(spot / step) * step)
@@ -2643,6 +2663,8 @@ def run_live(store: JournalStore, tg: TelegramSender, nse: NSESession) -> None:
         store.export_day(today_iso)
         return
 
+    prevent_system_sleep()
+
     market = MarketDataStore(session=nse, journal=store, holidays=holidays)
     session = DaySession(store, tg, classifier, event_day, today_iso,
                          market=market, holidays=holidays, live_mode=True)
@@ -2714,12 +2736,14 @@ def run_live(store: JournalStore, tg: TelegramSender, nse: NSESession) -> None:
     wait_until(settings.EOD_SUMMARY_TIME)
     session.eod_if_due()
     wait_until(settings.SHUTDOWN_TIME)
+    exit_time_str = ist_now().strftime("%H:%M")
     shutdown_clean(store, tg, nse,
-                   f"clean exit {today_iso} 15:45 IST; next run next trading day 08:30")
+                   f"clean exit {today_iso} {exit_time_str} IST; next run next trading day 08:30")
 
 
 def shutdown_clean(store: JournalStore, tg: TelegramSender, nse: NSESession,
                    reason: str) -> None:
+    allow_system_sleep()
     store.journal_event("REGIME", notes=f"clean shutdown: {reason}")
     tg.send(messages.shutdown(reason))
     store.flush()
